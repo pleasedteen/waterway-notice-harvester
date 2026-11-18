@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>通行限制公示采集台</title>
+<style>
+  :root { --bd:#d7dde5; --bg:#f5f7fa; --pri:#2364aa; --ok:#1a7f4b; --warn:#b7791f; --err:#c0392b; --muted:#6b7785; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.55 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; color:#1f2933; background:var(--bg); }
+  header { background:#102a43; color:#fff; padding:14px 22px; display:flex; align-items:center; gap:16px; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:#9fb3c8; font-size:12px; }
+  nav { display:flex; gap:4px; background:#fff; border-bottom:1px solid var(--bd); padding:0 16px; }
+  nav button { border:0; background:none; padding:12px 18px; cursor:pointer; font-size:14px; color:var(--muted); border-bottom:3px solid transparent; }
+  nav button.active { color:var(--pri); border-bottom-color:var(--pri); font-weight:600; }
+  main { padding:20px; max-width:1280px; margin:0 auto; }
+  .panel { display:none; } .panel.active { display:block; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:8px; padding:16px; margin-bottom:16px; }
+  .card h2 { margin:0 0 10px; font-size:15px; }
+  button.act { background:var(--pri); color:#fff; border:0; border-radius:6px; padding:7px 14px; cursor:pointer; margin-right:8px; }
+  button.act.secondary { background:#e4e7eb; color:#1f2933; }
+  button.act.danger { background:var(--err); }
+  button.act:disabled { opacity:.5; cursor:not-allowed; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { border:1px solid var(--bd); padding:6px 9px; text-align:left; vertical-align:top; }
+  th { background:#f0f4f8; }
+  pre { background:#0f172a; color:#d8e2ec; padding:12px; border-radius:6px; overflow:auto; max-height:360px; font-size:12px; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; font-weight:600; }
+  .b-ok { background:#e6f6ee; color:var(--ok); }
+  .b-missing { background:#eef1f4; color:var(--muted); }
+  .b-none { background:#fff4e0; color:var(--warn); }
+  .b-error { background:#fde8e6; color:var(--err); }
+  .b-running { background:#e3effd; color:var(--pri); }
+  .b-completed { background:#e6f6ee; color:var(--ok); }
+  .b-failed,.b-edition_changed { background:#fde8e6; color:var(--err); }
+  .muted { color:var(--muted); font-size:12px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
+  input,select,textarea { font:inherit; padding:6px 9px; border:1px solid var(--bd); border-radius:6px; }
+  textarea { width:100%; min-height:220px; font-family:ui-monospace,Menlo,monospace; }
+  .ev { font-size:12px; color:var(--muted); margin-top:3px; }
+  .pass { color:var(--ok); font-weight:700; } .fail { color:var(--err); font-weight:700; }
+  details summary { cursor:pointer; font-weight:600; margin:4px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>通行限制公示采集台</h1>
+  <span class="sub">声明式规则 · 快照回归 · 断点续跑 · 原子发布（内置模拟站点，不访问外站）</span>
+</header>
+<nav>
+  <button data-tab="rules" class="active">规则版本</button>
+  <button data-tab="jobs">采集作业</button>
+  <button data-tab="regression">回归重放</button>
+  <button data-tab="publish">发布</button>
+  <button data-tab="snapshots">网页快照</button>
+</nav>
+<main>
+  <section id="panel-rules" class="panel active">
+    <div class="card">
+      <h2>规则版本（不可变）</h2>
+      <div class="row"><button class="act" onclick="loadRules()">刷新</button>
+        <button class="act secondary" onclick="showNewRule()">登记新规则版本（JSON）</button></div>
+      <div id="newRuleBox" style="display:none">
+        <textarea id="newRuleJson" placeholder='{"ruleId":"...","version":"...", ...}'></textarea>
+        <div class="row" style="margin-top:8px">
+          <button class="act" onclick="saveRule()">保存（同版本内容不同将被拒绝）</button>
+          <button class="act secondary" onclick="document.getElementById('newRuleBox').style.display='none'">取消</button>
+        </div>
+      </div>
+      <table><thead><tr><th>规则</th><th>版本</th><th>名称</th><th>身份字段</th><th>创建时间</th><th></th></tr></thead>
+      <tbody id="rulesBody"></tbody></table>
+    </div>
+  </section>
+
+  <section id="panel-jobs" class="panel">
+    <div class="card">
+      <h2>启动 / 续跑作业</h2>
+      <div class="row">
+        <label>规则 <select id="jobRule"></select></label>
+        <label>来源ID <input id="jobSource" value="mock-source" size="12" /></label>
+        <label>种子URL <input id="jobSeed" value="http://mock.local/notice/list" size="34" /></label>
+        <button class="act" onclick="startJob()">启动或续跑</button>
+      </div>
+      <p class="muted">模拟站点支持换版：先在浏览器控制台不可用时，可通过演示脚本体验。重启进程后对同一来源+规则再次"启动或续跑"即从检查点继续。</p>
+    </div>
+    <div class="card">
+      <h2>作业列表</h2>
+      <button class="act secondary" onclick="loadJobs()">刷新</button>
+      <table><thead><tr><th>作业</th><th>状态</th><th>规则版本</th><th>来源修订</th><th>条目(完成/总数)</th><th>更新时间</th><th>操作</th></tr></thead>
+      <tbody id="jobsBody"></tbody></table>
+      <details style="margin-top:10px"><summary>作业详情 JSON</summary><pre id="jobDetail">点击"查看"加载</pre></details>
+    </div>
+  </section>
+
+  <section id="panel-regression" class="panel">
+    <div class="card">
+      <h2>夹具与候选规则重放</h2>
+      <div class="row">
+        <label>夹具 <select id="repFixture"></select></label>
+        <label>候选规则 <select id="repRule"></select></label>
+        <button class="act" onclick="runReplay(true)">重放该夹具</button>
+        <button class="act secondary" onclick="runReplay(false)">全部夹具重放</button>
+      </div>
+      <table><thead><tr><th>夹具</th><th>来源修订</th><th>条目数</th><th>期望记录数</th><th>说明</th></tr></thead>
+      <tbody id="fixturesBody"></tbody></table>
+    </div>
+    <div class="card">
+      <h2>最近报告</h2>
+      <button class="act secondary" onclick="loadReports()">刷新</button>
+      <div id="reportSummary"></div>
+      <details style="margin-top:8px"><summary>报告完整 JSON（含字段变化与证据定位）</summary><pre id="reportDetail">运行重放后展示</pre></details>
+    </div>
+  </section>
+
+  <section id="panel-publish" class="panel">
+    <div class="card">
+      <h2>发布闸门</h2>
+      <div class="row">
+        <label>作业 <select id="pubJob"></select></label>
+        <label>规则 <select id="pubRule"></select></label>
+        <button class="act secondary" onclick="evaluatePub()">评估</button>
+        <button class="act" onclick="doPublish()">原子发布</button>
+      </div>
+      <pre id="pubDecision">尚未评估</pre>
+    </div>
+    <div class="card">
+      <h2>当前生效发布与历史</h2>
+      <button class="act secondary" onclick="loadPubs()">刷新</button>
+      <div id="pubs"></div>
+    </div>
+  </section>
+
+  <section id="panel-snapshots" class="panel">
+    <div class="card">
+      <h2>网页快照（原始证据）</h2>
+      <button class="act secondary" onclick="loadSnaps()">刷新</button>
+      <table><thead><tr><th>快照</th><th>来源修订</th><th>URL</th><th>抓取时间</th><th>状态码</th><th></th></tr></thead>
+      <tbody id="snapsBody"></tbody></table>
+      <details style="margin-top:8px"><summary>快照 HTML</summary><pre id="snapDetail">选择快照查看</pre></details>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const badge = (s) => `<span class="badge b-${s}">${s}</span>`;
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
+}
+const post = (path, body) => api(path, { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body ?? {}) });
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  $('panel-' + b.dataset.tab).classList.add('active');
+  refreshAll();
+});
+
+async function ruleOptions(sel) {
+  const rules = await api('/api/rules');
+  sel.innerHTML = rules.map(r => `<option value="${r.ruleId}|${r.version}">${r.ruleId}@${r.version}</option>`).join('');
+  return rules;
+}
+
+async function loadRules() {
+  const rules = await api('/api/rules');
+  $('rulesBody').innerHTML = rules.map(r => `<tr>
+    <td>${r.ruleId}</td><td><strong>${r.version}</strong></td><td>${r.name}</td>
+    <td>${r.identity.join(' + ')}</td><td class="muted">${r.createdAt}</td>
+    <td><button class="act secondary" onclick='showRule(${JSON.stringify(JSON.stringify(r))})'>查看</button></td></tr>`).join('');
+  await ruleOptions($('jobRule')); await ruleOptions($('repRule')); await ruleOptions($('pubRule'));
+}
+function showRule(json) { alert('规则文档（只读，版本不可变）\n\n' + JSON.stringify(JSON.parse(json), null, 2)); }
+function showNewRule() { $('newRuleBox').style.display = 'block'; }
+async function saveRule() {
+  try { await post('/api/rules', JSON.parse($('newRuleJson').value)); $('newRuleBox').style.display='none'; await loadRules(); }
+  catch (e) { alert(e.message); }
+}
+
+async function loadJobs() {
+  const jobs = await api('/api/jobs');
+  $('jobsBody').innerHTML = jobs.map(j => `<tr>
+    <td>${j.jobId.slice(-8)}</td><td>${badge(j.status)}</td><td>${j.ruleVersion}</td>
+    <td>${j.expectedRevision}</td><td>${j.entries.filter(e=>e.status==='done').length}/${j.entries.length}</td>
+    <td class="muted">${j.updatedAt}</td>
+    <td>
+      <button class="act" onclick="runJob('${j.jobId}')">续跑一步</button>
+      <button class="act secondary" onclick="viewJob('${j.jobId}')">查看</button>
+    </td></tr>`).join('');
+  $('pubJob').innerHTML = jobs.map(j => `<option value="${j.jobId}">${j.jobId.slice(-8)} (${j.status})</option>`).join('');
+}
+async function startJob() {
+  const [ruleId, version] = $('jobRule').value.split('|');
+  const job = await post('/api/jobs/start', { ruleId, version, sourceId:$('jobSource').value, seedUrl:$('jobSeed').value, useMock:true });
+  await runJob(job.jobId);
+}
+async function runJob(jobId) {
+  const job = await post(`/api/jobs/${jobId}/run`, { maxEntriesPerCall: 2 });
+  await viewJob(jobId); await loadJobs();
+  if (job.status === 'running' || job.status === 'failed') console.log('作业仍可续跑:', job.status, job.lastError);
+}
+async function viewJob(jobId) { $('jobDetail').textContent = JSON.stringify(await api('/api/jobs/' + jobId), null, 2); }
+
+async function loadFixtures() {
+  const fs = await api('/api/fixtures');
+  $('fixturesBody').innerHTML = fs.map(f => `<tr>
+    <td>${f.name}</td><td>${f.expectedRevision}</td><td>${f.entries.length}</td>
+    <td>${f.expectedRecords.length}</td><td class="muted">${f.note ?? ''}</td></tr>`).join('');
+  $('repFixture').innerHTML = fs.map(f => `<option value="${f.fixtureId}">${f.name}</option>`).join('');
+}
+async function runReplay(single) {
+  const [ruleId, version] = $('repRule').value.split('|');
+  const body = { ruleId, version, sourceId:'mock-source' };
+  if (single) body.fixtureId = $('repFixture').value;
+  const r = await post('/api/regression/run', body);
+  const reports = Array.isArray(r) ? r : [r];
+  $('reportSummary').innerHTML = reports.map(x => `<p>夹具 <strong>${x.fixtureId.slice(-8)}</strong>：
+    <span class="${x.passed?'pass':'fail'}">${x.passed?'通过':'未通过'}</span>
+    ｜新增 ${x.recordsAdded} 删除 ${x.recordsRemoved} 字段变化 ${x.fieldsChanged}
+    类型不兼容 ${x.typeIncompatibilities} 新失败 ${x.failures}
+    ${x.attribution ? '｜归因 <strong>' + attrText(x.attribution) + '</strong>' : ''}
+    ${x.attributionReason ? '<br><span class="muted">' + x.attributionReason + '</span>' : ''}
+    ${x.expectationMismatches.length ? '<br><span class="fail">' + x.expectationMismatches.join('<br>') + '</span>' : ''}</p>`).join('');
+  $('reportDetail').textContent = JSON.stringify(r, null, 2);
+}
+function attrText(a) { return {source_change:'来源内容变化', rule_behavior_change:'规则行为变化', both:'两者同时变化', undeterminable:'无法判定（证据不足）', none:'无变化'}[a] || a; }
+async function loadReports() {
+  const rs = await api('/api/reports');
+  $('reportSummary').innerHTML = rs.slice(0,10).map(x =>
+    `<p>${x.ruleVersion} / ${x.fixtureId.slice(-8)}：<span class="${x.passed?'pass':'fail'}">${x.passed?'通过':'未通过'}</span> <span class="muted">${x.ranAt}</span></p>`).join('') || '<p class="muted">暂无报告</p>';
+}
+
+async function evaluatePub() {
+  const [ruleId, version] = $('pubRule').value.split('|');
+  const d = await post('/api/publish/evaluate', { jobId:$('pubJob').value, ruleId, version });
+  $('pubDecision').textContent = (d.allowed ? '✅ 允许发布\n' : '⛔ 拒绝发布\n') + d.reasons.map(r=>' - '+r).join('\n') + '\n\n回归报告: ' + d.reports.map(r=>r.reportId.slice(-8)).join(', ');
+}
+async function doPublish() {
+  const [ruleId, version] = $('pubRule').value.split('|');
+  try {
+    const pub = await post('/api/publish', { jobId:$('pubJob').value, ruleId, version, note:'网页端发布' });
+    $('pubDecision').textContent = '已发布: ' + pub.publicationId + '，记录数 ' + pub.records.length;
+    await loadPubs();
+  } catch (e) { $('pubDecision').textContent = e.message; }
+}
+async function loadPubs() {
+  const pubs = await api('/api/publications?sourceId=mock-source');
+  const cur = await api('/api/publications/current?sourceId=mock-source');
+  $('pubs').innerHTML = (cur ? `<p>当前生效：<strong>${cur.publicationId.slice(-8)}</strong> 规则 ${cur.ruleVersion} 修订 ${cur.sourceRevision} 记录 ${cur.records.length} 条 <span class="muted">${cur.publishedAt}</span></p>` : '<p class="muted">尚无生效发布</p>')
+    + '<table><thead><tr><th>发布</th><th>规则</th><th>来源修订</th><th>记录数</th><th>时间</th></tr></thead><tbody>'
+    + pubs.map(p => `<tr><td>${p.publicationId.slice(-8)}</td><td>${p.ruleVersion}</td><td>${p.sourceRevision}</td><td>${p.records.length}</td><td class="muted">${p.publishedAt}</td></tr>`).join('') + '</tbody></table>';
+}
+
+async function loadSnaps() {
+  const ss = await api('/api/snapshots?sourceId=mock-source');
+  $('snapsBody').innerHTML = ss.map(s => `<tr><td>${s.snapshotId.slice(-8)}</td><td>${s.revision}</td><td>${s.url}</td><td class="muted">${s.fetchedAt}</td><td>${s.statusCode}</td>
+    <td><button class="act secondary" onclick="viewSnap('${s.snapshotId}')">查看</button></td></tr>`).join('');
+}
+async function viewSnap(id) { $('snapDetail').textContent = (await api('/api/snapshots/' + id)).html; }
+
+async function refreshAll() {
+  try {
+    await Promise.all([loadRules(), loadJobs(), loadFixtures(), loadReports(), loadPubs(), loadSnaps()]);
+  } catch (e) { console.error(e); }
+}
+refreshAll();
+</script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+{
+  "name": "traffic-restriction-collector",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "通行限制公示采集台：声明式规则、快照回归、断点续跑、原子发布",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "demo": "tsx src/demo/run-demo.ts",
+    "test": "node --import tsx --test tests/normalize.test.ts tests/engine.test.ts tests/workflow.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "start": "tsx src/server/index.ts",
+    "mock": "tsx src/mock/site.ts",
+    "verify:restart": "tsx scripts/verify-restart.ts"
+  },
+  "dependencies": {
+    "node-html-parser": "^7.0.1",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
