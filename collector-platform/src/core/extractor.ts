@@ -366,6 +366,17 @@ export function extractFromSnapshots(snapshots: Snapshot[], rule: RuleDocument):
   return mergeDetailPages(pages, rule);
 }
 
+/**
+ * 列表预取字段并入详情记录：仅补充记录中不存在、且预取非 missing 的字段。
+ * 采集与离线重放共用同一实现，保证两侧产物可逐字段比对。
+ */
+export function applyPrefetch(record: BusinessRecord, prefetch: Record<string, ExtractedField>): BusinessRecord {
+  for (const [k, v] of Object.entries(prefetch)) {
+    if (!record.fields[k] && v.value.status !== 'missing') record.fields[k] = v;
+  }
+  return record;
+}
+
 /** 顶层字段值的便捷读取 */
 export function fieldValue(rec: BusinessRecord, field: string): CanonicalValue | null {
   return rec.fields[field]?.value ?? null;

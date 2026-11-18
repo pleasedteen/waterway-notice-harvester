@@ -1,13 +1,17 @@
 /**
  * 发布服务。发布前置条件（任一不满足即拒绝）：
  *  1. 作业状态 completed（完整批次，无失败条目、无换版）；
- *  2. 全部条目来自同一来源修订；
- *  3. 作业使用的规则版本与待发布规则完全一致；
- *  4. 该规则版本在全部相关夹具上回归通过；
- *  5. 规则文档与整批结果在同一原子事务内一起生效。
+ *  2. 列表发现完整（未达到上限截断、无未采下一页）；
+ *  3. 全部条目来自同一来源修订；
+ *  4. 作业使用的规则版本与待发布规则完全一致；
+ *  5. 批次离线重放通过：按候选规则用作业快照重放列表发现、预取与详情续页，
+ *     与检查点逐条一致（漏页/证据不足 => 拒绝，上一版本继续生效）；
+ *  6. 该规则版本在全部相关夹具上回归通过（旧详情夹具逐字段比对）；
+ *  7. 规则文档与整批结果在同一原子事务内一起生效。
  * 发布中途重启：current 指针未切换前，上一完整发布保持可读。
  */
 import { newId, nowIso } from '../core/ids.js';
+import { replayBatch } from './batch-replay.js';
 import type { CrawlJob, Publication, RegressionReport, RuleDocument, Store } from '../core/types.js';
 
 export interface PublishDecision {
@@ -25,6 +29,9 @@ export class PublishService {
     if (!job) return { allowed: false, reasons: [`作业不存在: ${jobId}`], reports: [] };
 
     if (job.status !== 'completed') reasons.push(`作业状态为 ${job.status}，仅 completed 可发布`);
+    if (job.listDiscovery && job.listDiscovery !== 'completed') {
+      reasons.push(`列表发现状态为 ${job.listDiscovery}（${job.listNextUrl ?? '无待采页'}），批次不完整`);
+    }
     if (job.ruleId !== rule.ruleId || job.ruleVersion !== rule.version) {
       reasons.push(`规则版本不一致: 作业使用 ${job.ruleId}@${job.ruleVersion}，候选 ${rule.ruleId}@${rule.version}`);
     }
@@ -37,6 +44,12 @@ export class PublishService {
     }
     if (revisions.size > 1) reasons.push(`批次包含多个来源修订: ${[...revisions].join(', ')}`);
     if (job.entries.some((e) => e.status !== 'done' || !e.record)) reasons.push('存在未完成条目，批次不完整');
+
+    // 批次离线重放：候选规则 + 作业快照，重放列表发现/预取/详情续页并逐条比对
+    if (job.status === 'completed' && job.ruleId === rule.ruleId && job.ruleVersion === rule.version) {
+      const replay = await replayBatch(job, rule, this.store);
+      for (const p of replay.problems) reasons.push(`批次离线重放: ${p}`);
+    }
 
     const reports = await this.runRegression(rule, job.sourceId, job.expectedRevision);
     const failed = reports.filter((r) => !r.passed);

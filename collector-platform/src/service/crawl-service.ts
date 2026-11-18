@@ -2,11 +2,15 @@
  * 采集编排：
  * - 每个条目/分页完成即落检查点，进程重启后从断点继续；
  * - 全程校验来源 revision，发现换版 => 作业置 edition_changed 并阻断发布；
+ * - 列表发现同样断点续跑：沿用已采列表页快照推导下一页继续，绝不因"已有部分条目"
+ *   跳过发现阶段（否则列表第 2 页失败后重跑会漏公告却显示完成）；
+ * - 列表/详情达到页数上限仍有下一页 => 整批不完整（truncated / 条目 failed），禁止发布；
  * - 分页失败不丢弃已采页，条目标 failed 且整批不完整；
  * - "未采到"绝不解释为删除：只有整批成功完成才可发布，发布集仅来自本批记录。
  */
 import { contentHash, type Fetcher } from '../fetch/fetcher.js';
 import {
+  applyPrefetch,
   extractListEntries,
   extractNextPage,
   mergeDetailPages,
@@ -17,6 +21,7 @@ import type {
   BusinessRecord,
   CrawlJob,
   JobEntryState,
+  JobStatus,
   RuleDocument,
   Snapshot,
   Store,
@@ -51,6 +56,8 @@ export class CrawlService {
       expectedRevision: revision,
       status: 'running',
       listSnapshotIds: [],
+      listDiscovery: 'pending',
+      listNextUrl: null,
       entries: [],
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -84,8 +91,13 @@ export class CrawlService {
     const rule = await this.store.getRule(job.ruleId, job.ruleVersion);
     if (!rule) throw new Error(`规则缺失: ${job.ruleId}@${job.ruleVersion}`);
 
-    // 1. 发现列表条目（带列表分页），结果同样检查点化
-    if (job.entries.length === 0) {
+    // 旧版本作业缺少列表发现状态：一律按 pending 重新核对（沿用已有快照，不会重复抓取）
+    job.listDiscovery ??= 'pending';
+    job.listNextUrl ??= null;
+
+    // 1. 列表发现（带列表分页，可断点续跑）：沿用已采列表页快照继续，
+    //    直到无下一页（completed）或确认达到上限仍有下一页（truncated）。
+    if (job.listDiscovery === 'pending') {
       try {
         await this.discoverEntries(job, rule);
       } catch (e) {
@@ -95,6 +107,20 @@ export class CrawlService {
         await this.store.saveJob(job);
         return job;
       }
+    }
+    if (job.listDiscovery === 'truncated') {
+      // 达到页数上限仍有下一页：整批不完整，绝不置 completed
+      job.status = 'failed';
+      job.lastError = `列表分页达到上限仍有下一页未采集: ${job.listNextUrl ?? '?'}，批次不完整`;
+      job.updatedAt = nowIso();
+      await this.store.saveJob(job);
+      return job;
+    }
+    // discoverEntries 可能检出换版（checkRevision 改写 job.status）
+    const statusAfterDiscovery: JobStatus = job.status;
+    if (statusAfterDiscovery === 'edition_changed') {
+      await this.store.saveJob(job);
+      return job;
     }
 
     // 2. 逐条采集详情（含续页），跳过已完成
@@ -111,9 +137,9 @@ export class CrawlService {
       }
     }
 
-    // 3. 整批改判：所有条目 done 才能 completed
+    // 3. 整批改判：列表发现完整 + 所有条目 done 才能 completed
     job.updatedAt = nowIso();
-    if (job.entries.every((e) => e.status === 'done')) {
+    if (job.listDiscovery === 'completed' && job.entries.every((e) => e.status === 'done')) {
       job.status = 'completed';
       job.finishedAt = nowIso();
     } else if (job.entries.some((e) => e.status === 'failed')) {
@@ -124,37 +150,81 @@ export class CrawlService {
     return job;
   }
 
+  /**
+   * 列表发现（断点续跑）：
+   * - 已采列表页快照直接复用，从最后一个快照离线推导下一页继续抓取；
+   * - 每页落检查点；抓取失败抛出，状态保持 pending，重跑从断点页重试；
+   * - 达到 maxPages 仍有下一页 => truncated（整批不完整）。
+   */
   private async discoverEntries(job: CrawlJob, rule: RuleDocument): Promise<void> {
-    const seen = new Set<string>();
-    let listUrl: string | null = job.seedUrl;
-    let listPageNo = 0;
-    while (listUrl && listPageNo < (rule.list?.pagination?.maxPages ?? 1)) {
-      listPageNo += 1;
+    // 无列表配置：seedUrl 即单条详情
+    if (!rule.list) {
+      if (job.entries.length === 0) {
+        job.entries.push(this.newEntry(job.seedUrl, {}));
+      }
+      job.listDiscovery = 'completed';
+      job.listNextUrl = null;
+      await this.store.saveJob(job);
+      return;
+    }
+
+    const pagination = rule.list.pagination;
+    const maxPages = pagination?.maxPages ?? 1;
+    const seen = new Set(job.entries.map((e) => e.entryUrl));
+
+    // 续跑：已有列表页快照不重复抓取
+    const listSnaps: Snapshot[] = [];
+    for (const sid of job.listSnapshotIds) {
+      const s = await this.store.getSnapshot(sid);
+      if (s) listSnaps.push(s);
+    }
+    const lastSnap = listSnaps[listSnaps.length - 1];
+    let listUrl: string | null =
+      listSnaps.length === 0
+        ? job.seedUrl
+        : pagination
+          ? extractNextPage(lastSnap!.html, pagination, lastSnap!.url)
+          : null;
+
+    while (listUrl) {
+      if (listSnaps.length >= maxPages) {
+        job.listDiscovery = 'truncated';
+        job.listNextUrl = listUrl;
+        job.updatedAt = nowIso();
+        await this.store.saveJob(job);
+        return;
+      }
       const fetched = await this.fetcher.fetch(listUrl);
       this.checkRevision(job, fetched.revision, listUrl);
       if (job.status === 'edition_changed') return;
       const snap = await this.persistSnapshot(job, fetched, listUrl);
       if (!job.listSnapshotIds.includes(snap.snapshotId)) job.listSnapshotIds.push(snap.snapshotId);
-      const entries = extractListEntries(snap.html, rule, listUrl);
-      for (const e of entries) {
+      listSnaps.push(snap);
+      for (const e of extractListEntries(snap.html, rule, listUrl)) {
         if (seen.has(e.url)) continue;
         seen.add(e.url);
-        job.entries.push({
-          entryUrl: e.url,
-          prefetch: e.prefetch,
-          status: 'pending',
-          snapshotIds: [],
-          pagesMerged: [],
-          record: null,
-          attempts: 0,
-          lastError: null,
-          updatedAt: nowIso(),
-        });
+        job.entries.push(this.newEntry(e.url, e.prefetch));
       }
-      if (!rule.list?.pagination) break;
-      listUrl = extractNextPage(snap.html, rule.list.pagination, listUrl);
-      await this.store.saveJob(job);
+      listUrl = pagination ? extractNextPage(snap.html, pagination, listUrl) : null;
+      await this.store.saveJob(job); // 每页落检查点
     }
+    job.listDiscovery = 'completed';
+    job.listNextUrl = null;
+    await this.store.saveJob(job);
+  }
+
+  private newEntry(entryUrl: string, prefetch: JobEntryState['prefetch']): JobEntryState {
+    return {
+      entryUrl,
+      prefetch,
+      status: 'pending',
+      snapshotIds: [],
+      pagesMerged: [],
+      record: null,
+      attempts: 0,
+      lastError: null,
+      updatedAt: nowIso(),
+    };
   }
 
   private async crawlEntry(job: CrawlJob, rule: RuleDocument, entry: JobEntryState): Promise<void> {
@@ -170,11 +240,11 @@ export class CrawlService {
       pages.push({ url: s.url, html: s.html, page: pages.length + 1 });
     }
 
+    const maxPages = rule.pagination?.maxPages ?? 1;
     let nextUrl: string | null = pages.length === 0 ? entry.entryUrl : this.nextUrlOf(rule, pages[pages.length - 1]!);
-    let guard = 0;
     try {
-      while (nextUrl && guard < (rule.pagination?.maxPages ?? 1)) {
-        guard += 1;
+      // 页数上限按条目总分页数计（含续跑复用的快照），防止跨次运行绕过上限
+      while (nextUrl && pages.length < maxPages) {
         const fetched = await this.fetcher.fetch(nextUrl);
         this.checkRevision(job, fetched.revision, nextUrl);
         if (job.status === 'edition_changed') return;
@@ -184,18 +254,20 @@ export class CrawlService {
         await this.store.saveJob(job); // 每页落检查点
         nextUrl = rule.pagination ? extractNextPage(snap.html, rule.pagination, nextUrl) : null;
       }
+      if (nextUrl) {
+        // 达到页数上限仍有下一页：条目续页不完整，绝不按残缺页面合并出"完成"记录
+        throw new Error(`详情续页达到上限(maxPages=${maxPages})仍有下一页未采集: ${nextUrl}`);
+      }
 
       // 合并预取字段（缺失不覆盖详情页结果）
       const record: BusinessRecord = mergeDetailPages(pages, rule);
-      for (const [k, v] of Object.entries(entry.prefetch)) {
-        if (!record.fields[k] && v.value.status !== 'missing') record.fields[k] = v;
-      }
+      applyPrefetch(record, entry.prefetch);
       entry.record = record;
       entry.pagesMerged = record.pagesMerged;
       entry.status = 'done';
       entry.lastError = null;
     } catch (e) {
-      // 分页失败：保留已采页面与检查点，条目标 failed，整批不完整
+      // 分页失败/续页截断：保留已采页面与检查点，条目标 failed，整批不完整
       entry.status = 'failed';
       entry.lastError = (e as Error).message;
       job.lastError = `条目 ${entry.entryUrl} 采集失败: ${entry.lastError}`;

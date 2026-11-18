@@ -13,7 +13,9 @@ const BASE = `http://localhost:${PORT}`;
 const dataDir = await mkdtemp(join(tmpdir(), 'collector-restart-'));
 
 function startServer(): ReturnType<typeof spawn> {
-  return spawn('npx', ['tsx', 'src/server/index.ts'], {
+  // 直接 spawn node（不经 npx/sh 包装），保证 kill 信号作用于服务进程本身，
+  // 否则包装进程被杀、服务子进程残留占用端口，下一轮验证会连到旧进程
+  return spawn(process.execPath, ['--import', 'tsx', 'src/server/index.ts'], {
     env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir },
     stdio: 'ignore',
   });
@@ -43,9 +45,10 @@ try {
   let srv = startServer();
   await waitReady();
   const job = await post('/api/jobs/start', { ruleId: 'rule-mock-notice', version: '1.0.0', sourceId: 'mock-source', useMock: true });
+  if (!job?.jobId) throw new Error(`作业启动失败: ${JSON.stringify(job)}`);
   await post(`/api/jobs/${job.jobId}/run`, { maxEntriesPerCall: 1 });
   const midway = await (await fetch(`${BASE}/api/jobs/${job.jobId}`)).json();
-  check('强杀前完成 1/4 条目', midway.entries.filter((e: any) => e.status === 'done').length === 1);
+  check('强杀前完成 1/5 条目', (midway.entries ?? []).filter((e: any) => e.status === 'done').length === 1);
   srv.kill('SIGKILL');
   await wait(800);
 
@@ -62,7 +65,7 @@ try {
   }
   check('重启续跑后整批 completed', status === 'completed', status);
   const final = await (await fetch(`${BASE}/api/jobs/${job.jobId}`)).json();
-  check('4 个条目全部成功', final.entries.length === 4 && final.entries.every((e: any) => e.status === 'done'));
+  check('5 个条目全部成功', final.entries.length === 5 && final.entries.every((e: any) => e.status === 'done'));
   srv.kill('SIGTERM');
   await wait(300);
 } finally {

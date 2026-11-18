@@ -32,6 +32,7 @@ export const MOCK_URLS = {
   detailA2: `${BASE}/notice/G2026-018?page=2`,
   detailB: `${BASE}/notice/G2026-021`,
   detailC: `${BASE}/notice/G2026-030`,
+  detailD: `${BASE}/notice/G2026-041`,
   detailBad: `${BASE}/notice/G2026-999`,
   revisionHeader: 'x-site-revision',
 } as const;
@@ -77,11 +78,19 @@ function listPage(state: MockState): string {
 }
 
 function listPage2(): string {
+  // 第二页含一个与第一页重复的条目（跨页去重场景）和一个仅存在于第二页的新公告
+  // （列表第二页抓不到 => 漏掉 G2026-041，用于验证整批完整性判断）
   return `<!doctype html><html><body>
 <ul class="notice-list">
   <li class="notice-item">
     <span class="notice-no">G2026-018</span>
     <a class="notice-link" href="/notice/G2026-018?page=1">锦江大桥限行公告（续页入口，同号不同航段在详情内区分）</a>
+  </li>
+  <li class="notice-item">
+    <span class="notice-no">G2026-041</span>
+    <a class="notice-link" href="/notice/G2026-041">云崖高架限行公告（仅列表第二页）</a>
+    <span class="notice-dept">区建交委</span>
+    <span class="notice-date">2026-11-14</span>
   </li>
 </ul>
 <nav class="pager"><span class="next disabled">下一页</span></nav>
@@ -202,6 +211,32 @@ function detailC(): string {
 }
 
 /**
+ * 公告 G2026-041：仅出现在列表第二页的公告（漏页检测素材）。单页、结构规整。
+ */
+function detailD(): string {
+  return `<!doctype html><html><body>
+<article class="notice-detail">
+  <h1 class="title">云崖高架通行限制公告</h1>
+  <span id="notice-no">G2026-041</span>
+  <span id="publish-dept">区建交委</span>
+  <span id="effective-date">2026年11月15日</span>
+  <p class="segment-name">高架主线段</p>
+  <table class="limit-table">
+    <thead><tr><th>航段</th><th>车型</th><th>限重</th><th>限高</th><th>是否限行</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>高架主线段</td><td>货车</td><td>18t</td><td>3.8米</td><td>限行</td><td>夜间禁行</td></tr>
+      <tr><td>高架主线段</td><td>小型车</td><td>无限制</td><td>无限制</td><td>不限行</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <ul class="time-window">
+    <li><span class="window-range">22:00-06:00</span><span class="window-note">夜间时段</span></li>
+  </ul>
+  <nav class="pager"><span class="next disabled">下一页</span></nav>
+</article>
+</body></html>`;
+}
+
+/**
  * 公告 G2026-999：结构异常，身份字段缺失 -> 记录级失败。
  */
 function detailBad(): string {
@@ -222,6 +257,7 @@ function render(url: string, state: MockState): string {
   if (path === '/notice/G2026-018') return detailAPage1(state);
   if (path === '/notice/G2026-021') return detailB();
   if (path === '/notice/G2026-030') return detailC();
+  if (path === '/notice/G2026-041') return detailD();
   if (path === '/notice/G2026-999') return detailBad();
   return '<html><body><h1>404</h1></body></html>';
 }
@@ -276,7 +312,7 @@ export function buildMockFixtures(): { url: string; html: string; revision: stri
   const v1 = createMockState();
   const v2 = createMockState();
   v2.edition = 'v2';
-  const urls = [MOCK_URLS.list, MOCK_URLS.listP2, MOCK_URLS.detailA1, MOCK_URLS.detailA2, MOCK_URLS.detailB, MOCK_URLS.detailC, MOCK_URLS.detailBad];
+  const urls = [MOCK_URLS.list, MOCK_URLS.listP2, MOCK_URLS.detailA1, MOCK_URLS.detailA2, MOCK_URLS.detailB, MOCK_URLS.detailC, MOCK_URLS.detailD, MOCK_URLS.detailBad];
   return urls.map((url) => ({ url, html: render(url, v1), revision: 'v1' }))
     .concat(urls.map((url) => ({ url, html: render(url, v2), revision: 'v2' })));
 }

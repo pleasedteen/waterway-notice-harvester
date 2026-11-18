@@ -14,7 +14,7 @@ import { PublishService } from '../src/service/publish-service.js';
 import { MockFetcher, createMockState, MOCK_URLS } from '../src/mock/site.js';
 import { RULE_V1, RULE_V2, RULE_REGRESSED } from '../src/core/rule-catalog.js';
 import {
-  goldenNoticeA, goldenNoticeB, goldenNoticeC, goldenNoticeBad, goldenNoticeA_v2,
+  goldenNoticeA, goldenNoticeB, goldenNoticeC, goldenNoticeD, goldenNoticeBad, goldenNoticeA_v2,
 } from '../src/core/golden.js';
 import type { BusinessRecord, RuleDocument, Snapshot, Store } from '../src/core/types.js';
 
@@ -58,11 +58,12 @@ test('回归：正常规则通过，退化规则失败并带证据', async () =>
     { entryUrl: MOCK_URLS.detailA1, snapshots: [await snap(MOCK_URLS.detailA1, 'v1', 'a'), await snap(MOCK_URLS.detailA2, 'v1', 'a')] },
     { entryUrl: MOCK_URLS.detailB, snapshots: [await snap(MOCK_URLS.detailB, 'v1', 'b')] },
     { entryUrl: MOCK_URLS.detailC, snapshots: [await snap(MOCK_URLS.detailC, 'v1', 'c')] },
-    { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v1', 'd')] },
+    { entryUrl: MOCK_URLS.detailD, snapshots: [await snap(MOCK_URLS.detailD, 'v1', 'd')] },
+    { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v1', 'e')] },
   ];
   const fx = await regression.createFixture({
     fixtureId: 'fx-test-v1', name: '测试夹具', sourceId: 'mock-source', entries,
-    expectedRecords: [goldenNoticeA(), goldenNoticeB(), goldenNoticeC(), goldenNoticeBad()].map(strip),
+    expectedRecords: [goldenNoticeA(), goldenNoticeB(), goldenNoticeC(), goldenNoticeD(), goldenNoticeBad()].map(strip),
   });
   const ok = await regression.replay(fx.fixtureId, RULE_V1);
   assert.equal(ok.passed, true);
@@ -79,18 +80,20 @@ test('归因：来源变化 / 两者同变 / 无法判定', async () => {
     { entryUrl: MOCK_URLS.detailA1, snapshots: [await snap(MOCK_URLS.detailA1, 'v1', 'g1'), await snap(MOCK_URLS.detailA2, 'v1', 'g1')] },
     { entryUrl: MOCK_URLS.detailB, snapshots: [await snap(MOCK_URLS.detailB, 'v1', 'g2')] },
     { entryUrl: MOCK_URLS.detailC, snapshots: [await snap(MOCK_URLS.detailC, 'v1', 'g3')] },
-    { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v1', 'g4')] },
+    { entryUrl: MOCK_URLS.detailD, snapshots: [await snap(MOCK_URLS.detailD, 'v1', 'g4')] },
+    { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v1', 'g5')] },
   ];
   const v2 = [
     { entryUrl: MOCK_URLS.detailA1, snapshots: [await snap(MOCK_URLS.detailA1, 'v2', 'g1'), await snap(MOCK_URLS.detailA2, 'v2', 'g1')] },
     { entryUrl: MOCK_URLS.detailB, snapshots: [await snap(MOCK_URLS.detailB, 'v2', 'g2')] },
     { entryUrl: MOCK_URLS.detailC, snapshots: [await snap(MOCK_URLS.detailC, 'v2', 'g3')] },
-    { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v2', 'g4')] },
+    { entryUrl: MOCK_URLS.detailD, snapshots: [await snap(MOCK_URLS.detailD, 'v2', 'g4')] },
+    { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v2', 'g5')] },
   ];
   const fx2 = await regression.createFixture({
     fixtureId: 'fx-test-v2', name: '归因夹具', sourceId: 'mock-source',
     entries: v2,
-    expectedRecords: [goldenNoticeA_v2(), goldenNoticeB(), goldenNoticeC(), goldenNoticeBad()].map(strip),
+    expectedRecords: [goldenNoticeA_v2(), goldenNoticeB(), goldenNoticeC(), goldenNoticeD(), goldenNoticeBad()].map(strip),
     baselineEntries: v1, baselineRule: RULE_V1,
   });
 
@@ -126,7 +129,7 @@ test('采集：中断后新实例靠检查点续跑完成', async () => {
   assert.equal(same.jobId, job.jobId);
   const done = await reboot.run(same.jobId);
   assert.equal(done.status, 'completed');
-  assert.equal(done.entries.length, 4);
+  assert.equal(done.entries.length, 5);
 });
 
 test('换版：采集中检测到修订变化，作业阻断且禁止发布', async () => {
@@ -181,11 +184,12 @@ test('发布闸门：完整批次可发布，退化/版本不一致被拒，上�
     { entryUrl: MOCK_URLS.detailA1, snapshots: [await snap(MOCK_URLS.detailA1, 'v1', 'p1'), await snap(MOCK_URLS.detailA2, 'v1', 'p1')] },
     { entryUrl: MOCK_URLS.detailB, snapshots: [await snap(MOCK_URLS.detailB, 'v1', 'p2')] },
     { entryUrl: MOCK_URLS.detailC, snapshots: [await snap(MOCK_URLS.detailC, 'v1', 'p3')] },
-    { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v1', 'p4')] },
+    { entryUrl: MOCK_URLS.detailD, snapshots: [await snap(MOCK_URLS.detailD, 'v1', 'p4')] },
+    { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v1', 'p5')] },
   ];
   await regression.createFixture({
     fixtureId: 'fx-pub', name: '发布门禁夹具', sourceId: 'src-pub', entries,
-    expectedRecords: [goldenNoticeA(), goldenNoticeB(), goldenNoticeC(), goldenNoticeBad()].map(strip),
+    expectedRecords: [goldenNoticeA(), goldenNoticeB(), goldenNoticeC(), goldenNoticeD(), goldenNoticeBad()].map(strip),
   });
   const ok = await publish.evaluate(job.jobId, RULE_V1);
   assert.equal(ok.allowed, true, ok.reasons.join(';'));

@@ -254,6 +254,54 @@ export function goldenNoticeC(): BusinessRecord {
   });
 }
 
+/** G2026-041：仅出现在列表第二页的公告（漏页检测素材），单页、结构规整 */
+export function goldenNoticeD(): BusinessRecord {
+  return buildRecord({
+    identity: 'noticeNo=G2026-041|segmentName=高架主线段',
+    identityParts: { noticeNo: 'G2026-041', segmentName: '高架主线段' },
+    top: {
+      noticeNo: ok('G2026-041'),
+      publishDept: ok('区建交委'),
+      effectiveDate: ok('2026-11-15'),
+      segmentName: ok('高架主线段'),
+      contactPhone: missing(),
+      listNoticeNo: ok('G2026-041'),
+      listTitle: ok('云崖高架限行公告（仅列表第二页）'),
+    },
+    tables: {
+      limitRows: [
+        {
+          identity: 'segment=高架主线段|vehicleType=货车',
+          fields: {
+            segment: ok('高架主线段'),
+            vehicleType: ok('货车'),
+            weightLimit: ok(18000, 'kg'),
+            heightLimit: ok(3.8, 'm'),
+            restricted: ok(true),
+            remark: ok('夜间禁行'),
+          },
+        },
+        {
+          identity: 'segment=高架主线段|vehicleType=小型车',
+          fields: {
+            segment: ok('高架主线段'),
+            vehicleType: ok('小型车'),
+            weightLimit: none('无限制'),
+            heightLimit: none('无限制'),
+            restricted: ok(false),
+            remark: none('—'),
+          },
+        },
+      ],
+    },
+    lists: {
+      timeWindows: [
+        { identity: 'windowRange=22:00-06:00', fields: { windowRange: ok('22:00-06:00'), windowNote: ok('夜间时段') } },
+      ],
+    },
+  });
+}
+
 /** G2026-999：身份字段 noticeNo 选择器不命中 -> 记录级失败（error 与 missing 区分演示） */
 export function goldenNoticeBad(): BusinessRecord {
   const top: Record<string, CanonicalValue> = {

@@ -173,6 +173,14 @@ export interface Snapshot {
 
 export type JobStatus = 'running' | 'completed' | 'failed' | 'edition_changed' | 'aborted';
 
+/**
+ * 列表发现进度：
+ * - pending：尚未发现到最后一页（中断后可沿用已有列表快照续跑）；
+ * - completed：已发现到无下一页；
+ * - truncated：达到页数上限仍有下一页（整批不完整，禁止完成与发布）。
+ */
+export type ListDiscoveryState = 'pending' | 'completed' | 'truncated';
+
 export interface JobEntryState {
   entryUrl: string;
   /** 列表页预取字段（JSON 化） */
@@ -198,6 +206,10 @@ export interface CrawlJob {
   status: JobStatus;
   /** 列表页快照 id（检查点，不参与详情合并） */
   listSnapshotIds: string[];
+  /** 列表发现状态：仅 completed 才允许整批完成与发布 */
+  listDiscovery: ListDiscoveryState;
+  /** 列表发现被页数上限截断时，尚未采集的下一页 URL（漏页证据） */
+  listNextUrl: string | null;
   entries: JobEntryState[];
   createdAt: string;
   updatedAt: string;

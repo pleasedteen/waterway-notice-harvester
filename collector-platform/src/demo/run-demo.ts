@@ -7,6 +7,7 @@
  *  5. 采集中断重启续跑
  *  6. 采集中换版阻断
  *  7. 分页失败 -> 批次不完整 -> 修复后续跑成功
+ *  7b. 列表第二页失败 -> 重跑沿用快照补齐公告；漏页/页数截断作业禁止发布
  *  8. 原子发布闸门、退化规则被拒、上一完整发布保留、历史可查
  * 全程内存模拟站点，不访问真实外站；嵌入式文件存储，无数据库/缓存进程。
  */
@@ -20,12 +21,12 @@ import { PublishService } from '../service/publish-service.js';
 import { MockFetcher, createMockState, MOCK_URLS } from '../mock/site.js';
 import { RULE_V1, RULE_V2, RULE_REGRESSED } from '../core/rule-catalog.js';
 import {
-  goldenNoticeA, goldenNoticeB, goldenNoticeC, goldenNoticeBad, goldenNoticeA_v2,
+  goldenNoticeA, goldenNoticeB, goldenNoticeC, goldenNoticeD, goldenNoticeBad, goldenNoticeA_v2,
 } from '../core/golden.js';
 import { extractFromSnapshots } from '../core/extractor.js';
 import { canonicalKey } from '../core/normalize.js';
 import { compareExpectations } from '../core/regression.js';
-import type { BusinessRecord, RuleDocument, Snapshot } from '../core/types.js';
+import type { BusinessRecord, CrawlJob, RuleDocument, Snapshot } from '../core/types.js';
 
 let pass = 0;
 let fail = 0;
@@ -133,6 +134,7 @@ async function main(): Promise<void> {
     { entryUrl: MOCK_URLS.detailA1, snapshots: aPages },
     { entryUrl: MOCK_URLS.detailB, snapshots: [await snap(MOCK_URLS.detailB)] },
     { entryUrl: MOCK_URLS.detailC, snapshots: [await snap(MOCK_URLS.detailC)] },
+    { entryUrl: MOCK_URLS.detailD, snapshots: [await snap(MOCK_URLS.detailD)] },
     { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad)] },
   ];
   const fixture = await regression.createFixture({
@@ -141,7 +143,7 @@ async function main(): Promise<void> {
     sourceId: 'mock-source',
     listSnapshots: [await snap(MOCK_URLS.list), await snap(MOCK_URLS.listP2)],
     entries: v1Entries,
-    expectedRecords: [goldA, goldB, goldenNoticeC(), goldenNoticeBad()].map(stripPrefetch),
+    expectedRecords: [goldA, goldB, goldenNoticeC(), goldenNoticeD(), goldenNoticeBad()].map(stripPrefetch),
     note: '黄金期望，四态齐备',
   });
   check('夹具已保存且快照可独立离线重放', (await store.listSnapshots()).length >= 7,
@@ -176,6 +178,7 @@ async function main(): Promise<void> {
     { entryUrl: MOCK_URLS.detailA1, snapshots: [await snap(MOCK_URLS.detailA1, 'v2'), await snap(MOCK_URLS.detailA2, 'v2')] },
     { entryUrl: MOCK_URLS.detailB, snapshots: [await snap(MOCK_URLS.detailB, 'v2')] },
     { entryUrl: MOCK_URLS.detailC, snapshots: [await snap(MOCK_URLS.detailC, 'v2')] },
+    { entryUrl: MOCK_URLS.detailD, snapshots: [await snap(MOCK_URLS.detailD, 'v2')] },
     { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad, 'v2')] },
   ];
   const fixtureV2 = await regression.createFixture({
@@ -183,7 +186,7 @@ async function main(): Promise<void> {
     name: '模拟站点 v2 夹具（A 公告限重真实变化 + 基线用于归因）',
     sourceId: 'mock-source',
     entries: v2Entries,
-    expectedRecords: [goldenNoticeA_v2(), goldB, goldenNoticeC(), goldenNoticeBad()].map(stripPrefetch),
+    expectedRecords: [goldenNoticeA_v2(), goldB, goldenNoticeC(), goldenNoticeD(), goldenNoticeBad()].map(stripPrefetch),
     note: '真实业务变化：30t -> 28t',
     baselineEntries: v1Entries,
     baselineRule: RULE_V1,
@@ -222,7 +225,7 @@ async function main(): Promise<void> {
   check('重启后识别到可续跑作业（不新建）', resumed.jobId === job1.jobId);
   const done = await crawlAfterReboot.run(resumed.jobId);
   check('续跑后整批完成', done.status === 'completed', done.status);
-  check('4 个条目全部成功', done.entries.every((e) => e.status === 'done') && done.entries.length === 4);
+  check('5 个条目全部成功（含列表第二页的 G2026-041）', done.entries.every((e) => e.status === 'done') && done.entries.length === 5);
   const recordAJob = done.entries.find((e) => e.entryUrl.includes('G2026-018'))!.record!;
   check('续跑产物与黄金期望 A 一致（含预取字段、四态、0/无值区分）',
     compareExpectations([goldA], [recordAJob]).length === 0,
@@ -268,6 +271,71 @@ async function main(): Promise<void> {
   const recovered = await recoveredCrawl.run(faultJob.jobId);
   check('故障消除后续跑成功，批次 completed', recovered.status === 'completed', recovered.status);
 
+  /* ---------- 7b. 列表第二页失败：续跑补齐；漏页/截断禁止发布 ---------- */
+  banner('7b. 列表分页失败：重跑沿用快照补齐公告；漏页作业禁止发布');
+  const lfStore = new EmbeddedStore(await mkdtemp(join(tmpdir(), 'collector-listfault-')));
+  await lfStore.init();
+  await lfStore.saveRule(RULE_V1);
+  const lfRegression = new RegressionService(lfStore);
+  await lfRegression.createFixture({
+    fixtureId: 'fixture-list-fault', name: '列表漏页门禁夹具', sourceId: 'src-list-fault',
+    entries: [
+      { entryUrl: MOCK_URLS.detailA1, snapshots: [await snap(MOCK_URLS.detailA1), await snap(MOCK_URLS.detailA2)] },
+      { entryUrl: MOCK_URLS.detailB, snapshots: [await snap(MOCK_URLS.detailB)] },
+      { entryUrl: MOCK_URLS.detailC, snapshots: [await snap(MOCK_URLS.detailC)] },
+      { entryUrl: MOCK_URLS.detailD, snapshots: [await snap(MOCK_URLS.detailD)] },
+      { entryUrl: MOCK_URLS.detailBad, snapshots: [await snap(MOCK_URLS.detailBad)] },
+    ],
+    expectedRecords: [goldA, goldB, goldenNoticeC(), goldenNoticeD(), goldenNoticeBad()].map(stripPrefetch),
+  });
+  const lfState = createMockState();
+  lfState.faults.set('list?page=2', 'error');
+  const lfCrawl = new CrawlService(lfStore, new MockFetcher(lfState));
+  const lfJob = await lfCrawl.startOrResume({ sourceId: 'src-list-fault', seedUrl: MOCK_URLS.list, rule: RULE_V1 });
+  const lfFailed = await lfCrawl.run(lfJob.jobId);
+  check('列表第二页失败：作业 failed，第一页条目与列表快照已落检查点',
+    lfFailed.status === 'failed' && lfFailed.entries.length === 4 && lfFailed.listSnapshotIds.length === 1,
+    lfFailed.lastError ?? '');
+  const lfFirstSnap = lfFailed.listSnapshotIds[0];
+  lfState.faults.clear();
+  const lfDone = await new CrawlService(lfStore, new MockFetcher(lfState)).run(lfJob.jobId);
+  check('重跑沿用第一页快照续采，第二页公告 G2026-041 补齐，整批 completed',
+    lfDone.status === 'completed' && lfDone.entries.length === 5 &&
+    lfDone.entries.some((e) => e.entryUrl.includes('G2026-041')) &&
+    lfDone.listSnapshotIds[0] === lfFirstSnap,
+    `条目 ${lfDone.entries.length}，列表快照 ${lfDone.listSnapshotIds.length}`);
+
+  // 模拟旧版本漏页作业：缺第二页快照与条目，却自称 completed —— 离线重放必须拦截
+  const legacy = JSON.parse(JSON.stringify(lfDone)) as CrawlJob;
+  legacy.jobId = 'job-legacy-leak';
+  legacy.status = 'completed';
+  legacy.listSnapshotIds = legacy.listSnapshotIds.slice(0, 1);
+  legacy.entries = legacy.entries.filter((e) => !e.entryUrl.includes('G2026-041'));
+  delete (legacy as Partial<CrawlJob>).listDiscovery;
+  delete (legacy as Partial<CrawlJob>).listNextUrl;
+  await lfStore.saveJob(legacy);
+  const lfPublish = new PublishService(lfStore);
+  const legacyDecision = await lfPublish.evaluate(legacy.jobId, RULE_V1);
+  check('漏页作业被发布闸门拒绝（重放发现仍有下一页未采集）',
+    !legacyDecision.allowed && legacyDecision.reasons.some((r) => r.includes('仍有下一页未采集')),
+    legacyDecision.reasons.find((r) => r.includes('重放')) ?? '');
+  const lfOk = await lfPublish.evaluate(lfJob.jobId, RULE_V1);
+  check('补齐后的完整批次评估通过（离线重放 + 夹具回归）', lfOk.allowed, lfOk.reasons.join(';'));
+
+  // 页数上限截断：仍有下一页不允许完成与发布
+  const RULE_CAP_LIST: RuleDocument = {
+    ...RULE_V1, version: 'cap-list-demo', createdAt: new Date().toISOString(),
+    list: { ...RULE_V1.list!, pagination: { ...RULE_V1.list!.pagination!, maxPages: 1 } },
+  };
+  await lfStore.saveRule(RULE_CAP_LIST);
+  const capCrawl = new CrawlService(lfStore, new MockFetcher(createMockState()));
+  const capJob = await capCrawl.startOrResume({ sourceId: 'src-list-fault', seedUrl: MOCK_URLS.list, rule: RULE_CAP_LIST });
+  const capRun = await capCrawl.run(capJob.jobId);
+  check('列表达到页数上限仍有下一页：批次截断（truncated）不置 completed',
+    capRun.status === 'failed' && capRun.listDiscovery === 'truncated', capRun.lastError ?? '');
+  const capDecision = await lfPublish.evaluate(capJob.jobId, RULE_CAP_LIST);
+  check('截断批次禁止发布', !capDecision.allowed);
+
   /* ---------- 8. 原子发布与闸门 ---------- */
   banner('8. 原子发布：完整批次 + 同规则版本 + 回归通过才生效');
   const decision = await publish.evaluate(job1.jobId, RULE_V1);
@@ -275,7 +343,7 @@ async function main(): Promise<void> {
   const pub1 = await publish.publish(job1.jobId, RULE_V1, '首次完整发布');
   const current1 = await publish.current('mock-source');
   check('发布后 current 指向新版本，规则与整批结果一起生效',
-    current1?.publicationId === pub1.publicationId && current1.records.length === 4);
+    current1?.publicationId === pub1.publicationId && current1.records.length === 5);
 
   const regressedDecision = await publish.evaluate(job1.jobId, RULE_REGRESSED);
   check('退化规则发布被闸门拒绝', !regressedDecision.allowed &&
@@ -307,6 +375,7 @@ async function main(): Promise<void> {
   await store.close();
   await switchStore.close();
   await faultStore.close();
+  await lfStore.close();
   if (fail > 0) process.exitCode = 1;
 }
 
