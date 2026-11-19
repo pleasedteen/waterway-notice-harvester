@@ -44,6 +44,9 @@ async function main(): Promise<void> {
     server.close(() => {
       void app.store.close().then(() => process.exit(0));
     });
+    // 结束客户端的 keep-alive 空闲连接，避免 close 回调迟迟不触发
+    server.closeIdleConnections();
+    setTimeout(() => process.exit(0), 3000).unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

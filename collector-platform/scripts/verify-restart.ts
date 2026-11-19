@@ -13,10 +13,20 @@ const BASE = `http://localhost:${PORT}`;
 const dataDir = await mkdtemp(join(tmpdir(), 'collector-restart-'));
 
 function startServer(): ReturnType<typeof spawn> {
+  // detached 让 npx/sh/node 共享一个进程组，强杀时整组一起结束，避免端口被孤儿进程占用
   return spawn('npx', ['tsx', 'src/server/index.ts'], {
     env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir },
     stdio: 'ignore',
+    detached: true,
   });
+}
+function killServer(srv: ReturnType<typeof spawn>, signal: NodeJS.Signals): void {
+  if (!srv.pid) return;
+  try {
+    process.kill(-srv.pid, signal);
+  } catch {
+    srv.kill(signal);
+  }
 }
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function waitReady(): Promise<void> {
@@ -46,7 +56,7 @@ try {
   await post(`/api/jobs/${job.jobId}/run`, { maxEntriesPerCall: 1 });
   const midway = await (await fetch(`${BASE}/api/jobs/${job.jobId}`)).json();
   check('强杀前完成 1/4 条目', midway.entries.filter((e: any) => e.status === 'done').length === 1);
-  srv.kill('SIGKILL');
+  killServer(srv, 'SIGKILL');
   await wait(800);
 
   // 第二次进程：仅靠磁盘检查点恢复
@@ -63,7 +73,7 @@ try {
   check('重启续跑后整批 completed', status === 'completed', status);
   const final = await (await fetch(`${BASE}/api/jobs/${job.jobId}`)).json();
   check('4 个条目全部成功', final.entries.length === 4 && final.entries.every((e: any) => e.status === 'done'));
-  srv.kill('SIGTERM');
+  killServer(srv, 'SIGTERM');
   await wait(300);
 } finally {
   await rm(dataDir, { recursive: true, force: true });

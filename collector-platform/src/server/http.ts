@@ -77,7 +77,49 @@ export function createHttpServer(app: App, opts: { port: number; mockState?: Ret
       return send(res, f ? 200 : 404, f ?? { error: '夹具不存在' });
     }
 
+    // 报告汇总：只返回摘要（全量计数 + 页索引），不含任何变化明细
     if (p === '/api/reports' && method === 'GET') return send(res, 200, await app.store.listRegressionReports());
+    // 报告摘要 + 首屏（第 0 页）明细
+    if (p.match(/^\/api\/reports\/[^/]+\/summary$/) && method === 'GET') {
+      const id = p.split('/')[3]!;
+      const summary = await app.store.getRegressionReport(id);
+      if (!summary) return send(res, 404, { error: '报告不存在' });
+      const record = await app.store.getReportChangePage(id, 'record', 0);
+      const expectation = await app.store.getReportExpectationPage(id, 0);
+      return send(res, 200, {
+        ...summary,
+        preview: {
+          recordChanges: record?.changes ?? [],
+          expectationMismatches: expectation?.mismatches ?? [],
+        },
+      });
+    }
+    // 按页读取变化明细：单页 ≤ 500 条
+    if (p.match(/^\/api\/reports\/[^/]+\/changes\/[^/]+$/) && method === 'GET') {
+      const parts = p.split('/');
+      const id = parts[3]!;
+      const stream = parts[5]!;
+      if (stream !== 'record' && stream !== 'source' && stream !== 'rule') {
+        return send(res, 400, { error: '变化流必须是 record/source/rule' });
+      }
+      const page = Number(url.searchParams.get('page') ?? '0');
+      try {
+        return send(res, 200, await app.regression.changePage(id, stream, page));
+      } catch {
+        return send(res, 404, { error: '报告或变化流不存在' });
+      }
+    }
+    // 按页读取期望失配
+    if (p.match(/^\/api\/reports\/[^/]+\/expectations$/) && method === 'GET') {
+      const id = p.split('/')[3]!;
+      const page = Number(url.searchParams.get('page') ?? '0');
+      try {
+        return send(res, 200, await app.regression.expectationPage(id, page));
+      } catch {
+        return send(res, 404, { error: '报告不存在' });
+      }
+    }
+    // 报告摘要（不含明细）——放在 /summary 与 /changes 之后匹配
     if (p.startsWith('/api/reports/') && method === 'GET') {
       const r = await app.store.getRegressionReport(p.split('/').pop()!);
       return send(res, r ? 200 : 404, r ?? { error: '报告不存在' });
@@ -87,10 +129,11 @@ export function createHttpServer(app: App, opts: { port: number; mockState?: Ret
       const body = await readBody(req);
       const rule = await app.store.getRule(body.ruleId, body.version);
       if (!rule) return send(res, 404, { error: '规则版本不存在' });
+      // 只返回摘要（全量计数与页索引）；明细通过 /api/reports/:id/changes 翻页读取
       if (body.fixtureId) {
-        return send(res, 200, await app.regression.replay(body.fixtureId, rule));
+        return send(res, 200, await app.regression.replaySummary(body.fixtureId, rule));
       }
-      return send(res, 200, await app.regression.replayAll(rule, body.sourceId));
+      return send(res, 200, await app.regression.replayAllSummaries(rule, body.sourceId));
     }
 
     if (p === '/api/jobs' && method === 'GET') return send(res, 200, await app.store.listJobs());
@@ -145,13 +188,14 @@ export function createHttpServer(app: App, opts: { port: number; mockState?: Ret
       const sourceId = url.searchParams.get('sourceId') ?? undefined;
       return send(res, 200, await app.store.listPublications(sourceId));
     }
-    if (p.startsWith('/api/publications/') && method === 'GET') {
-      const pub = await app.store.getPublication(p.split('/').pop()!);
-      return send(res, pub ? 200 : 404, pub ?? { error: '发布不存在' });
-    }
+    // current 必须先于前缀匹配，否则会被当作 publicationId="current" 处理
     if (p === '/api/publications/current' && method === 'GET') {
       const sourceId = url.searchParams.get('sourceId') ?? 'mock-source';
       return send(res, 200, await app.publish.current(sourceId));
+    }
+    if (p.startsWith('/api/publications/') && method === 'GET') {
+      const pub = await app.store.getPublication(p.split('/').pop()!);
+      return send(res, pub ? 200 : 404, pub ?? { error: '发布不存在' });
     }
 
     if (p === '/api/sources' && method === 'GET') return send(res, 200, await app.store.listSources());

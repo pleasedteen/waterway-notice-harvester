@@ -8,7 +8,7 @@
 ```bash
 npm install
 npm run demo     # 端到端验收演示：50 项断言，覆盖全部要求场景（约 1 秒）
-npm test         # 22 个单元/集成测试（node:test，约 1 秒）
+npm test         # 32 个单元/集成测试（node:test，含一万条变化的分页压力用例）
 npm run verify:restart  # 真实进程强杀后重启，验证检查点续跑（约 3 秒）
 npm start        # 启动本地网页界面与 REST 接口：http://localhost:8080
 ```
@@ -31,6 +31,7 @@ npm start        # 启动本地网页界面与 REST 接口：http://localhost:80
 | 规则版本不可变 | 同 `ruleId+version` 内容不同的保存被存储层拒绝 |
 | 网页快照 + 回归夹具 | 每次抓取存快照；夹具带期望 canonical 结果，可完全离线重放 |
 | 重放报告 | 新增/删除/字段变化/类型不兼容/新失败，逐条带原始网页证据（URL、选择器、表格行列、分页） |
+| 大量变化分页 | 全量计数与发布结论不变；明细按页持久化。生成时内存只缓冲一页（≤ 500 条），读取汇总加载 0 条、读取单页 ≤ 500 条 |
 | 来源变化 vs 规则行为变化 | 四象限归因 `attributeChanges`：旧快照×新旧规则隔离规则侧，同规则×新旧快照隔离来源侧；对照存在失败时标 `undeterminable` |
 | 中断续跑 | 列表/条目/每页均落检查点（`CrawlService`）；重启后识别同来源同规则的未完成作业，复用已抓快照 |
 | 采集中换版 | 来源修订（revision）逐页校验，不一致即 `edition_changed` 并阻断发布 |
@@ -49,7 +50,8 @@ src/
     html-sanitizer.ts   通用脏 HTML 容错
     table-grid.ts       rowspan/colspan 网格、表头与重复表头处理
     extractor.ts        声明式抽取引擎、续页合并、列表/分页发现
-    regression.ts       记录/字段 diff、期望比对、双变归因、报告
+    regression.ts       记录/字段 diff（流式）、期望比对、双变归因、全量计数
+    report-paging.ts    报告分页原语：单页 500 条、分页写入器、旧格式兼容
     rule-catalog.ts     规则版本 v1 / v2 / 退化候选
     golden.ts           回归夹具的黄金期望（手工 canonical 值）
   storage/
@@ -64,7 +66,7 @@ src/
     app.ts              装配工厂
   server/               HTTP REST 接口
   web/index.html        本地单页界面（规则/作业/回归/发布/快照）
-tests/                  node:test 测试套件
+tests/                  node:test 测试套件（含 fixtures/ 一万条变化离线夹具）
 ```
 
 ## 规则怎么写（声明式）
@@ -119,11 +121,16 @@ tests/                  node:test 测试套件
 | `GET/POST /api/rules` | 列出/登记规则版本（同版本内容不同被拒） |
 | `GET /api/snapshots`, `GET /api/snapshots/:id` | 快照列表与原始 HTML 证据 |
 | `GET /api/fixtures`, `GET /api/fixtures/:id` | 回归夹具 |
-| `POST /api/regression/run` | 候选规则重放（`fixtureId` 单个，否则全部），返回 diff/归因/证据 |
+| `POST /api/regression/run` | 候选规则重放（`fixtureId` 单个，否则全部），返回**摘要**（全量计数、归因、页索引），不含变化明细 |
+| `GET /api/reports` | 报告摘要列表（不含明细，读取时加载 0 条变化） |
+| `GET /api/reports/:id` | 单个报告摘要（全量计数 + 各变化流页数） |
+| `GET /api/reports/:id/summary` | 摘要 + 第 0 页预览（≤ 500 条） |
+| `GET /api/reports/:id/changes/:stream?page=N` | 按页读取变化明细（`stream` = `record`/`source`/`rule`，单页 ≤ 500 条，含原始网页证据） |
+| `GET /api/reports/:id/expectations?page=N` | 按页读取期望失配（单页 ≤ 500 条） |
 | `POST /api/jobs/start` | 启动或续跑作业（同来源同规则自动回到未完成作业） |
 | `POST /api/jobs/:id/run` | 推进一个检查点步长（可反复调用） |
 | `GET /api/jobs`, `GET /api/jobs/:id` | 作业与检查点详情 |
-| `POST /api/publish/evaluate` | 发布闸门评估（通过/拒绝原因/回归报告） |
+| `POST /api/publish/evaluate` | 发布闸门评估（通过/拒绝原因/回归报告摘要；只读全量计数,不加载明细） |
 | `POST /api/publish` | 原子发布 |
 | `GET /api/publications`, `/api/publications/current` | 历史与当前生效发布 |
 
@@ -138,6 +145,21 @@ npm start
 
 `PostgresStore` 启动时幂等建表；发布在单事务内先写完整 publication 再切换 `current_publication`，
 事务中断自动回滚，current 始终指向最近一个完整发布。
+
+## 报表分页与内存上限
+
+回归报告的变化明细可能上万条，因此报告拆成"摘要 + 按页明细"两部分：
+
+- **摘要**：全量计数（新增/删除/字段变化/类型不兼容/失败）、归因、通过结论与各变化流的页索引。
+  发布闸门、`GET /api/reports` 与网页汇总只读摘要，加载 **0** 条明细。
+- **明细**：`record`/`source`/`rule` 三个变化流与期望失配各自分页持久化，单页上限 `REPORT_PAGE_SIZE = 500`。
+  网页与 `GET /api/reports/:id/changes/...` 每次只读一页（≤ 500 条）。
+- **生成**：字段级流式 diff，边产出边写页，内存中只缓冲当前一页（峰值 ≤ 500 条）；单条记录自身超过一页时按页切片，
+  计数只认首个片段，`recordsAdded/recordsRemoved` 不会被重复统计。
+- **原子性**：明细页先落盘，摘要最后提交；中途失败不会留下可见的半份报告。
+- **兼容与重启**：旧格式（明细内联）报告仍可查询并分页读取；重启后同一报告 id 的摘要与各页逐条一致。
+
+`tests/report-paging.test.ts` 用一万条变化的离线夹具验证上述上限与重启一致性。
 
 ## 模拟站点覆盖的场景
 

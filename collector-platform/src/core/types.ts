@@ -264,6 +264,62 @@ export interface RecordChange {
   fieldChanges: FieldChange[];
   pagesMergedBefore: number[];
   pagesMergedAfter: number[];
+  /**
+   * 单条记录的变化明细超过一页时按 500 条字段变化切片，这里是 0 基片段序号。
+   * 记录级计数只看 fragmentIndex 0/缺省，避免片段重复计数。
+   */
+  fragmentIndex?: number;
+}
+
+/** 报告中可独立分页的变化流 */
+export type ChangeStream = 'record' | 'source' | 'rule';
+
+/**
+ * 单条记录变化流中的"片段"：一条记录可能产出多条字段变化，
+ * 逐条产出使调用方永远不必一次性持有该记录的全部字段变化。
+ * fieldChange 为 null 表示该记录没有字段变化（如 unchanged），仍需产出一条记录变化。
+ */
+export interface RecordChangePart {
+  /** 记录在流中的序号（同一记录的所有片段共享），用于按记录合并 */
+  recordIndex: number;
+  identity: string;
+  kind: RecordChange['kind'];
+  pagesMergedBefore: number[];
+  pagesMergedAfter: number[];
+  fieldChange: FieldChange | null;
+}
+
+/** 分页索引：只记录数量与页数，不包含变化明细 */
+export interface ChangeStreamIndex {
+  /** 明细总数（片段按明细条数计） */
+  total: number;
+  /** 记录级条目数（拆分片段只计一次） */
+  records: number;
+  pages: number;
+  pageSize: number;
+}
+
+/** 按页读取的变化明细（一页最多 REPORT_PAGE_SIZE 条） */
+export interface ChangePage {
+  reportId: string;
+  stream: ChangeStream;
+  /** 0 基页码 */
+  page: number;
+  pageSize: number;
+  pages: number;
+  /** 明细总数（不是页数） */
+  total: number;
+  changes: RecordChange[];
+}
+
+/** 按页读取的期望失配明细 */
+export interface ExpectationPage {
+  reportId: string;
+  page: number;
+  pageSize: number;
+  pages: number;
+  total: number;
+  mismatches: string[];
 }
 
 export type Attribution =
@@ -273,15 +329,15 @@ export type Attribution =
   | 'undeterminable'
   | 'none';
 
-export interface RegressionReport {
+/** 报告摘要：不含变化明细，网页/接口列表与发布闸门只读这一份 */
+export interface RegressionReportSummary {
   reportId: string;
   fixtureId: string;
   ruleId: string;
   ruleVersion: string;
   ranAt: string;
   passed: boolean;
-  recordChanges: RecordChange[];
-  /** 记录级新增/删除统计 */
+  /** 全量计数（由完整变化流统计，不因分页/截断而丢失） */
   recordsAdded: number;
   recordsRemoved: number;
   fieldsChanged: number;
@@ -290,13 +346,49 @@ export interface RegressionReport {
   /** 双变归因（仅在提供对照快照/规则时产生） */
   attribution?: Attribution;
   attributionReason?: string;
-  /** 归因为来源内容变化时，隔离出的来源侧记录变化（含证据） */
-  sourceChanges?: RecordChange[];
-  /** 归因为规则行为变化时，隔离出的规则侧记录变化（含证据） */
-  ruleChanges?: RecordChange[];
-  /** 与夹具期望结果的直接比对（重放当前夹具） */
+  /** 与夹具期望结果的直接比对 */
   expectationMatches: boolean;
+  expectationMismatchCount: number;
+  /** 各变化流的索引（数量与页数），明细按页读取 */
+  streams: {
+    record: ChangeStreamIndex;
+    source?: ChangeStreamIndex;
+    rule?: ChangeStreamIndex;
+    expectation: ChangeStreamIndex;
+  };
+}
+
+/**
+ * 完整报告 = 摘要 + 首屏变化明细。
+ * 首屏只读取第 0 页（最多 REPORT_PAGE_SIZE 条），其余通过分页接口读取；
+ * 统计与通过/拒绝结论永远来自全量数据。
+ */
+export interface RegressionReport extends RegressionReportSummary {
+  /** record 流第 0 页（最多 REPORT_PAGE_SIZE 条），便于既有调用方直接展示 */
+  recordChanges: RecordChange[];
+  /** source 流第 0 页 */
+  sourceChanges?: RecordChange[];
+  /** rule 流第 0 页 */
+  ruleChanges?: RecordChange[];
+  /** 期望失配第 0 页 */
   expectationMismatches: string[];
+}
+
+/** 按页写入报告：页先落盘，commit 写入摘要后报告才可见（崩溃不会出现半份报告） */
+export interface RegressionReportWriter {
+  /** 写入一个变化流的一页（page 为 0 基页码） */
+  writeChangePage(
+    stream: ChangeStream,
+    page: number,
+    pageSize: number,
+    changes: RecordChange[],
+  ): Promise<void>;
+  /** 写入期望失配的一页 */
+  writeExpectationPage(page: number, pageSize: number, mismatches: string[]): Promise<void>;
+  /** 原子提交摘要：此后报告对读取方可见 */
+  commit(summary: RegressionReportSummary): Promise<void>;
+  /** 放弃生成（不写摘要，报告不可见） */
+  abort(): Promise<void>;
 }
 
 /* ----------------------------- 发布 ----------------------------- */
@@ -344,13 +436,21 @@ export interface Store {
   getJob(jobId: string): Promise<CrawlJob | null>;
   listJobs(): Promise<CrawlJob[]>;
 
+  /** 保存报告摘要与首屏（第 0 页）明细；后续页由生成器按页写入 */
   saveRegressionReport(report: RegressionReport): Promise<void>;
-  getRegressionReport(reportId: string): Promise<RegressionReport | null>;
-  listRegressionReports(): Promise<RegressionReport[]>;
+  /** 创建分页报告写入器：明细页先落盘，commit 摘要后报告才可见 */
+  createRegressionReportWriter(reportId: string): RegressionReportWriter;
+  /** 只读摘要（不含变化明细；读取汇总时加载 0 条明细） */
+  getRegressionReport(reportId: string): Promise<RegressionReportSummary | null>;
+  /** 只读摘要列表（不含变化明细） */
+  listRegressionReports(): Promise<RegressionReportSummary[]>;
+  /** 按页读取某个变化流的明细：页大小恒为 REPORT_PAGE_SIZE，一次只加载一页 */
+  getReportChangePage(reportId: string, stream: ChangeStream, page: number): Promise<ChangePage | null>;
+  /** 按页读取期望失配：一次只加载一页 */
+  getReportExpectationPage(reportId: string, page: number): Promise<ExpectationPage | null>;
 
   /** 原子发布：提交后 currentPublication 切换，中途失败保留上一完整发布 */
-  commitPublication(pub: Publication): Promise<void>;
-  getCurrentPublication(sourceId: string): Promise<Publication | null>;
+  commitPublication(pub: Publication): Promise<void>;  getCurrentPublication(sourceId: string): Promise<Publication | null>;
   getPublication(publicationId: string): Promise<Publication | null>;
   listPublications(sourceId?: string): Promise<Publication[]>;
 

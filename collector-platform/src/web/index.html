@@ -41,6 +41,13 @@
   .ev { font-size:12px; color:var(--muted); margin-top:3px; }
   .pass { color:var(--ok); font-weight:700; } .fail { color:var(--err); font-weight:700; }
   details summary { cursor:pointer; font-weight:600; margin:4px 0; }
+  .pager-bar { display:flex; gap:8px; align-items:center; margin:8px 0; }
+  .pager-bar button { background:#e4e7eb; border:0; border-radius:6px; padding:5px 12px; cursor:pointer; }
+  .pager-bar button:disabled { opacity:.45; cursor:not-allowed; }
+  .stats { display:flex; gap:14px; flex-wrap:wrap; margin:6px 0; }
+  .stats span b { font-size:16px; }
+  .change-id { font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .ev-list { margin:2px 0 0; padding-left:16px; }
 </style>
 </head>
 <body>
@@ -109,7 +116,8 @@
       <h2>最近报告</h2>
       <button class="act secondary" onclick="loadReports()">刷新</button>
       <div id="reportSummary"></div>
-      <details style="margin-top:8px"><summary>报告完整 JSON（含字段变化与证据定位）</summary><pre id="reportDetail">运行重放后展示</pre></details>
+      <div id="reportPager"></div>
+      <div id="reportChanges"></div>
     </div>
   </section>
 
@@ -219,20 +227,118 @@ async function runReplay(single) {
   if (single) body.fixtureId = $('repFixture').value;
   const r = await post('/api/regression/run', body);
   const reports = Array.isArray(r) ? r : [r];
-  $('reportSummary').innerHTML = reports.map(x => `<p>夹具 <strong>${x.fixtureId.slice(-8)}</strong>：
-    <span class="${x.passed?'pass':'fail'}">${x.passed?'通过':'未通过'}</span>
-    ｜新增 ${x.recordsAdded} 删除 ${x.recordsRemoved} 字段变化 ${x.fieldsChanged}
-    类型不兼容 ${x.typeIncompatibilities} 新失败 ${x.failures}
-    ${x.attribution ? '｜归因 <strong>' + attrText(x.attribution) + '</strong>' : ''}
-    ${x.attributionReason ? '<br><span class="muted">' + x.attributionReason + '</span>' : ''}
-    ${x.expectationMismatches.length ? '<br><span class="fail">' + x.expectationMismatches.join('<br>') + '</span>' : ''}</p>`).join('');
-  $('reportDetail').textContent = JSON.stringify(r, null, 2);
+  if (!reports.length) { $('reportSummary').innerHTML = '<p class="muted">没有可重放的夹具</p>'; return; }
+  // 重放接口只返回摘要；明细按页加载
+  showReport(reports[reports.length - 1]);
 }
 function attrText(a) { return {source_change:'来源内容变化', rule_behavior_change:'规则行为变化', both:'两者同时变化', undeterminable:'无法判定（证据不足）', none:'无变化'}[a] || a; }
+
+/** 当前正在翻页查看的报告 */
+let currentReport = null;
+let currentStream = 'record';
+const pageState = { record:0, source:0, rule:0, expectation:0 };
+
+function streamIndex(summary, stream) {
+  return summary.streams ? summary.streams[stream] : undefined;
+}
+
+function showReport(summary) {
+  currentReport = summary;
+  currentStream = 'record';
+  pageState.record = 0; pageState.source = 0; pageState.rule = 0; pageState.expectation = 0;
+  const idx = (s) => streamIndex(summary, s);
+  const meta = (s, label) => { const i = idx(s); return i ? `${label} <b>${i.total}</b> 条 / ${i.pages} 页` : `${label} 无`; };
+  $('reportSummary').innerHTML = `<p>夹具 <strong>${summary.fixtureId.slice(-8)}</strong> 规则 ${summary.ruleVersion}：
+    <span class="${summary.passed?'pass':'fail'}">${summary.passed?'通过':'未通过'}</span>
+    <span class="muted">${summary.ranAt}</span></p>
+    <div class="stats">
+      <span>新增 <b>${summary.recordsAdded}</b></span>
+      <span>删除 <b>${summary.recordsRemoved}</b></span>
+      <span>字段变化 <b>${summary.fieldsChanged}</b></span>
+      <span>类型不兼容 <b>${summary.typeIncompatibilities}</b></span>
+      <span>新失败 <b>${summary.failures}</b></span>
+      <span>期望失配 <b>${summary.expectationMismatchCount}</b></span>
+    </div>
+    ${summary.attribution ? `<p>归因 <strong>${attrText(summary.attribution)}</strong>${summary.attributionReason ? `<br><span class="muted">${summary.attributionReason}</span>` : ''}</p>` : ''}
+    <p class="muted">${meta('record','记录变化')} ｜ ${meta('source','来源侧')} ｜ ${meta('rule','规则侧')} ｜ ${meta('expectation','期望失配')}</p>`;
+  $('reportPager').innerHTML = `
+    <div class="pager-bar">
+      <label>变化流
+        <select id="streamPick" onchange="switchStream(this.value)">
+          <option value="record">记录变化</option>
+          <option value="source" ${idx('source')?'':'disabled'}>来源侧</option>
+          <option value="rule" ${idx('rule')?'':'disabled'}>规则侧</option>
+          <option value="expectation">期望失配</option>
+        </select>
+      </label>
+      <button class="act secondary" onclick="prevPage()">上一页</button>
+      <span id="pagerInfo" class="muted"></span>
+      <button class="act secondary" onclick="nextPage()">下一页</button>
+    </div>`;
+  loadChangePage();
+}
+
+function switchStream(s) {
+  if (s !== 'record' && s !== 'expectation' && !streamIndex(currentReport, s)) return;
+  currentStream = s;
+  loadChangePage();
+}
+function prevPage() { pageState[currentStream] = Math.max(0, pageState[currentStream] - 1); loadChangePage(); }
+function nextPage() { pageState[currentStream] += 1; loadChangePage(); }
+
+async function loadChangePage() {
+  if (!currentReport) return;
+  const reportId = currentReport.reportId;
+  const stream = currentStream;
+  const page = pageState[stream];
+  if (stream === 'expectation') {
+    const p = await api(`/api/reports/${reportId}/expectations?page=${page}`);
+    pageState.expectation = Math.min(page, Math.max(0, p.pages - 1));
+    $('pagerInfo').textContent = p.total ? `第 ${p.page + 1} / ${p.pages} 页，共 ${p.total} 条` : '无失配';
+    $('reportChanges').innerHTML = p.mismatches.length
+      ? `<table><thead><tr><th>期望失配</th></tr></thead><tbody>${p.mismatches.map(m=>`<tr><td class="fail">${escapeHtml(m)}</td></tr>`).join('')}</tbody></table>`
+      : '<p class="muted">无期望失配</p>';
+    return;
+  }
+  const p = await api(`/api/reports/${reportId}/changes/${stream}?page=${page}`);
+  pageState[stream] = Math.min(page, Math.max(0, p.pages - 1));
+  $('pagerInfo').textContent = p.total ? `第 ${p.page + 1} / ${p.pages} 页，共 ${p.total} 条（单页 ≤ ${p.pageSize}）` : '无变化';
+  if (!p.changes.length) { $('reportChanges').innerHTML = '<p class="muted">本页没有变化明细</p>'; return; }
+  const rows = p.changes.map(rc => {
+    const fields = rc.fieldChanges.map(fc => `<tr>
+      <td>${escapeHtml(fc.kind)}</td><td>${escapeHtml(fc.field)}</td>
+      <td>${fmtVal(fc.before)}</td><td>${fmtVal(fc.after)}</td>
+      <td>${fmtEvidence(fc.evidence)}</td></tr>`).join('');
+    return `<tr><td colspan="5" style="background:#f8fafc"><span class="change-id">${escapeHtml(rc.identity)}</span>
+      <span class="muted">（${rc.kind}，变化 ${rc.fieldChanges.length} 项）</span></td></tr>${fields}`;
+  }).join('');
+  $('reportChanges').innerHTML = `<table><thead><tr><th>变化类型</th><th>字段</th><th>变化前</th><th>变化后</th><th>原始网页证据</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function fmtVal(v) { if (!v) return '<span class="muted">—</span>'; return `${escapeHtml(v.status)}${v.value !== null ? ': ' + escapeHtml(String(v.value)) + (v.unit?(' '+v.unit):'') : (v.noneMarker?(' ('+v.noneMarker+')'):'')}`; }
+function fmtEvidence(ev) {
+  if (!ev || !ev.length) return '<span class="muted">—</span>';
+  return `<ul class="ev-list">${ev.map(e=>`<li><span class="muted">${escapeHtml(e.url)}</span> ｜ <code>${escapeHtml(e.selector)}</code>${e.row?` ｜ 行${e.row}列${e.col}`:''} ｜ 第${e.page}页 ｜ ${escapeHtml(e.text)}</li>`).join('')}</ul>`;
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
 async function loadReports() {
   const rs = await api('/api/reports');
-  $('reportSummary').innerHTML = rs.slice(0,10).map(x =>
-    `<p>${x.ruleVersion} / ${x.fixtureId.slice(-8)}：<span class="${x.passed?'pass':'fail'}">${x.passed?'通过':'未通过'}</span> <span class="muted">${x.ranAt}</span></p>`).join('') || '<p class="muted">暂无报告</p>';
+  if (!rs.length) { $('reportSummary').innerHTML = '<p class="muted">暂无报告</p>'; $('reportPager').innerHTML = ''; $('reportChanges').innerHTML = ''; return; }
+  reportIndex = new Map(rs.map(x => [x.reportId, x]));
+  $('reportSummary').innerHTML = '<table><thead><tr><th>规则</th><th>夹具</th><th>结论</th><th>记录变化</th><th>字段变化</th><th>时间</th><th></th></tr></thead><tbody>'
+    + rs.slice(0,20).map(x => `<tr>
+      <td>${escapeHtml(x.ruleVersion)}</td><td>${escapeHtml(x.fixtureId.slice(-8))}</td>
+      <td><span class="${x.passed?'pass':'fail'}">${x.passed?'通过':'未通过'}</span></td>
+      <td>+${x.recordsAdded}/-${x.recordsRemoved}</td><td>${x.fieldsChanged}</td>
+      <td class="muted">${x.ranAt}</td>
+      <td><button class="act secondary" onclick="showReportById('${escapeHtml(x.reportId)}')">查看</button></td></tr>`).join('') + '</tbody></table>';
+  $('reportPager').innerHTML = '';
+  $('reportChanges').innerHTML = '<p class="muted">选择一条报告查看按页变化明细</p>';
+}
+let reportIndex = new Map();
+function showReportById(reportId) {
+  const summary = reportIndex.get(reportId);
+  if (summary) showReport(summary);
 }
 
 async function evaluatePub() {

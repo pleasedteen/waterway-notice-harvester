@@ -8,12 +8,19 @@
  * 发布中途重启：current 指针未切换前，上一完整发布保持可读。
  */
 import { newId, nowIso } from '../core/ids.js';
-import type { CrawlJob, Publication, RegressionReport, RuleDocument, Store } from '../core/types.js';
+import type {
+  CrawlJob,
+  Publication,
+  RegressionReportSummary,
+  RuleDocument,
+  Store,
+} from '../core/types.js';
 
 export interface PublishDecision {
   allowed: boolean;
   reasons: string[];
-  reports: RegressionReport[];
+  /** 门禁只读报告摘要（全量计数与通过结论），不加载任何变化明细 */
+  reports: RegressionReportSummary[];
 }
 
 export class PublishService {
@@ -46,10 +53,10 @@ export class PublishService {
     return { allowed: reasons.length === 0, reasons, reports };
   }
 
-  private async runRegression(rule: RuleDocument, sourceId: string, sourceRevision: string): Promise<RegressionReport[]> {
+  private async runRegression(rule: RuleDocument, sourceId: string, sourceRevision: string): Promise<RegressionReportSummary[]> {
     const { RegressionService } = await import('./regression-service.js');
     const svc = new RegressionService(this.store);
-    const all = await svc.replayAll(rule, sourceId);
+    const all = await svc.replayAllSummaries(rule, sourceId);
     // 仅与本批次来源修订一致的夹具构成发布门禁（其他修订的夹具仍可用于对比/归因）
     const fixtures = await this.store.listFixtures();
     const matchingIds = new Set(
