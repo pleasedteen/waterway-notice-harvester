@@ -29,6 +29,8 @@ async function main(): Promise<void> {
   const app = await createApp({
     dataDir,
     fetcher: new MockFetcher(mockState),
+    // 定时调度每个来源、每轮运行使用独立抓取器，避免一个来源的故障/挂起状态串到其他来源
+    fetcherFactory: () => new MockFetcher(createMockState()),
     store,
   });
 
@@ -41,6 +43,7 @@ async function main(): Promise<void> {
 
   const shutdown = (): void => {
     console.log('\n收到退出信号，关闭服务（已落检查点的作业可重启续跑）...');
+    app.scheduler.stop();
     server.close(() => {
       void app.store.close().then(() => process.exit(0));
     });

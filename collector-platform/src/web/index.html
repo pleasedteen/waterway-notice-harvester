@@ -50,6 +50,7 @@
 </header>
 <nav>
   <button data-tab="rules" class="active">规则版本</button>
+  <button data-tab="schedules">定时采集</button>
   <button data-tab="jobs">采集作业</button>
   <button data-tab="regression">回归重放</button>
   <button data-tab="publish">发布</button>
@@ -70,6 +71,28 @@
       </div>
       <table><thead><tr><th>规则</th><th>版本</th><th>名称</th><th>身份字段</th><th>创建时间</th><th></th></tr></thead>
       <tbody id="rulesBody"></tbody></table>
+    </div>
+  </section>
+
+  <section id="panel-schedules" class="panel">
+    <div class="card">
+      <h2>按来源定时采集（自动推进作业，发布仍需人工确认）</h2>
+      <div class="row">
+        <label>来源ID <input id="schSource" value="mock-source" size="12" /></label>
+        <label>规则 <select id="schRule"></select></label>
+        <label>间隔(ms) <input id="schInterval" type="number" value="60000" style="width:110px" /></label>
+        <label>接管时限(ms) <input id="schTakeover" type="number" value="5000" style="width:110px" /></label>
+        <label>每步条目 <input id="schBatch" type="number" value="2" style="width:80px" /></label>
+        <button class="act" onclick="saveSchedule()">保存配置</button>
+      </div>
+      <p class="muted">到点后调度器自动获取来源租约并推进作业；同一来源同一轮两个实例只启动一次，
+        手动续跑也受同源并发限制。推进实例失联超过接管时限后，另一实例沿用同一作业/规则版本/检查点接管，不重抓已确认页。</p>
+    </div>
+    <div class="card">
+      <h2>定时配置与来源租约</h2>
+      <button class="act secondary" onclick="loadSchedules()">刷新</button>
+      <table><thead><tr><th>来源</th><th>规则版本</th><th>间隔(ms)</th><th>接管(ms)</th><th>启用</th><th>最近触发</th><th>租约状态</th><th>持有者/轮次</th><th>操作</th></tr></thead>
+        <tbody id="schedulesBody"></tbody></table>
     </div>
   </section>
 
@@ -173,13 +196,60 @@ async function loadRules() {
     <td>${r.ruleId}</td><td><strong>${r.version}</strong></td><td>${r.name}</td>
     <td>${r.identity.join(' + ')}</td><td class="muted">${r.createdAt}</td>
     <td><button class="act secondary" onclick='showRule(${JSON.stringify(JSON.stringify(r))})'>查看</button></td></tr>`).join('');
-  await ruleOptions($('jobRule')); await ruleOptions($('repRule')); await ruleOptions($('pubRule'));
+  await ruleOptions($('jobRule')); await ruleOptions($('repRule')); await ruleOptions($('pubRule')); await ruleOptions($('schRule'));
 }
 function showRule(json) { alert('规则文档（只读，版本不可变）\n\n' + JSON.stringify(JSON.parse(json), null, 2)); }
 function showNewRule() { $('newRuleBox').style.display = 'block'; }
 async function saveRule() {
   try { await post('/api/rules', JSON.parse($('newRuleJson').value)); $('newRuleBox').style.display='none'; await loadRules(); }
   catch (e) { alert(e.message); }
+}
+
+async function saveSchedule() {
+  try {
+    const [ruleId, version] = $('schRule').value.split('|');
+    await post('/api/schedules', {
+      sourceId: $('schSource').value,
+      name: $('schSource').value,
+      seedUrl: 'http://mock.local/notice/list',
+      ruleId, version,
+      intervalMs: Number($('schInterval').value),
+      takeoverTimeoutMs: Number($('schTakeover').value),
+      maxEntriesPerCall: Number($('schBatch').value),
+      enabled: true,
+    });
+    await loadSchedules();
+    alert('定时配置已保存');
+  } catch (e) { alert(e.message); }
+}
+async function toggleSchedule(sourceId, enabled) {
+  await post(`/api/schedules/${sourceId}/enabled`, { enabled: !enabled });
+  await loadSchedules();
+}
+async function triggerTick(sourceId) {
+  try {
+    const r = await post(`/api/schedules/${sourceId}/tick`);
+    console.log('tick 结果', r);
+    await loadSchedules(); await loadJobs();
+  } catch (e) { alert(e.message); }
+}
+async function loadSchedules() {
+  const [schedules, leases] = await Promise.all([api('/api/schedules'), api('/api/leases')]);
+  const leaseOf = (id) => leases.find(l => l.sourceId === id);
+  $('schedulesBody').innerHTML = schedules.map(s => {
+    const l = leaseOf(s.sourceId);
+    const leaseText = l
+      ? `<span class="badge b-${l.state === 'active' ? 'running' : 'completed'}">${l.state}</span><br>
+         <span class="muted">${l.ownerId} / ${l.round} / 令牌${l.fencingToken}</span>`
+      : '<span class="muted">无</span>';
+    return `<tr>
+      <td>${s.sourceId}</td><td>${s.ruleVersion}</td><td>${s.intervalMs}</td><td>${s.takeoverTimeoutMs}</td>
+      <td><button class="act secondary" onclick="toggleSchedule('${s.sourceId}', ${s.enabled})">${s.enabled ? '启用中(点击停用)' : '已停用(点击启用)'}</button></td>
+      <td class="muted">${s.lastTriggeredAt ?? '—'}</td>
+      <td>${leaseText}</td>
+      <td><button class="act" onclick="triggerTick('${s.sourceId}')">立即评估一次</button></td>
+    </tr>`;
+  }).join('');
 }
 
 async function loadJobs() {
@@ -265,7 +335,7 @@ async function viewSnap(id) { $('snapDetail').textContent = (await api('/api/sna
 
 async function refreshAll() {
   try {
-    await Promise.all([loadRules(), loadJobs(), loadFixtures(), loadReports(), loadPubs(), loadSnaps()]);
+    await Promise.all([loadRules(), loadSchedules(), loadJobs(), loadFixtures(), loadReports(), loadPubs(), loadSnaps()]);
   } catch (e) { console.error(e); }
 }
 refreshAll();

@@ -8,7 +8,7 @@
 ```bash
 npm install
 npm run demo     # 端到端验收演示：50 项断言，覆盖全部要求场景（约 1 秒）
-npm test         # 22 个单元/集成测试（node:test，约 1 秒）
+npm test         # 32 个单元/集成/HTTP 测试（node:test，约 2 秒，含并发触发与失联接管）
 npm run verify:restart  # 真实进程强杀后重启，验证检查点续跑（约 3 秒）
 npm start        # 启动本地网页界面与 REST 接口：http://localhost:8080
 ```
@@ -33,6 +33,11 @@ npm start        # 启动本地网页界面与 REST 接口：http://localhost:80
 | 重放报告 | 新增/删除/字段变化/类型不兼容/新失败，逐条带原始网页证据（URL、选择器、表格行列、分页） |
 | 来源变化 vs 规则行为变化 | 四象限归因 `attributeChanges`：旧快照×新旧规则隔离规则侧，同规则×新旧快照隔离来源侧；对照存在失败时标 `undeterminable` |
 | 中断续跑 | 列表/条目/每页均落检查点（`CrawlService`）；重启后识别同来源同规则的未完成作业，复用已抓快照 |
+| 按来源定时采集 | `SchedulerService` 按接口配置的间隔/规则版本到点自动推进作业；**发布仍由人工确认**，调度器不发布 |
+| 同源并发限制 | 来源租约（嵌入式锁文件/PG 行锁 + 进程内互斥）保证同一来源同一轮两个实例只启动一次，手动续跑同样受限 |
+| 失联接管 | 心跳超过接管时限即判定失联，另一实例沿用**同一轮/同一作业**接管：保留规则版本与已确认页检查点、不重抓已确认页 |
+| 围栏写保护 | 租约易主/换轮递增 `fencingToken`，`saveJob` 校验 owner+令牌；旧实例迟到的结果/心跳被 `LeaseLostError` 拒绝，不能改写进度 |
+| 来源隔离 | 每个来源一条独立异步链，一个来源请求挂起只阻塞自身，不拖住其他来源 |
 | 采集中换版 | 来源修订（revision）逐页校验，不一致即 `edition_changed` 并阻断发布 |
 | 分页失败 | 已采页面保留、条目标 failed、批次不完整；"未采到"永不解释为删除 |
 | 发布闸门 | 仅 完整批次 + 同一来源修订 + 同一规则版本 + 回归通过 可发布；无夹具拒绝发布 |
@@ -58,7 +63,8 @@ src/
   fetch/fetcher.ts      Fetcher 抽象 + HTTP 实现
   mock/site.ts          内存模拟站点（换版/故障注入、脏 HTML、续表、全角单位）
   service/
-    crawl-service.ts    检查点、续跑、换版阻断、分页失败处理
+    crawl-service.ts    检查点、续跑、换版阻断、分页失败处理、租约围栏绑定
+    scheduler-service.ts 按来源定时调度、来源租约、同源并发限制、失联接管与围栏写保护
     regression-service.ts 夹具建立与离线重放
     publish-service.ts  发布闸门与原子提交
     app.ts              装配工厂
@@ -120,9 +126,13 @@ tests/                  node:test 测试套件
 | `GET /api/snapshots`, `GET /api/snapshots/:id` | 快照列表与原始 HTML 证据 |
 | `GET /api/fixtures`, `GET /api/fixtures/:id` | 回归夹具 |
 | `POST /api/regression/run` | 候选规则重放（`fixtureId` 单个，否则全部），返回 diff/归因/证据 |
-| `POST /api/jobs/start` | 启动或续跑作业（同来源同规则自动回到未完成作业） |
-| `POST /api/jobs/:id/run` | 推进一个检查点步长（可反复调用） |
+| `POST /api/jobs/start` | 启动或续跑作业（经来源租约，同来源同轮自动回到未完成作业，返回 `{outcome,job,lease}`） |
+| `POST /api/jobs/:id/run` | 推进一个检查点步长（手动续跑，受同源并发限制；忙时 409） |
 | `GET /api/jobs`, `GET /api/jobs/:id` | 作业与检查点详情 |
+| `GET/POST /api/schedules`, `GET/PUT /api/schedules/:sourceId` | 按来源配置采集间隔、规则版本、接管时限、每步条目数、启停 |
+| `POST /api/schedules/:sourceId/enabled` | 启用/停用某来源的定时采集 |
+| `POST /api/schedules/:sourceId/tick` | 手动触发一次调度评估（受间隔门控与租约限制） |
+| `GET /api/leases`, `GET /api/leases/:sourceId` | 来源租约状态（持有者、轮次、围栏令牌、心跳、释放/退避原因） |
 | `POST /api/publish/evaluate` | 发布闸门评估（通过/拒绝原因/回归报告） |
 | `POST /api/publish` | 原子发布 |
 | `GET /api/publications`, `/api/publications/current` | 历史与当前生效发布 |
@@ -155,3 +165,25 @@ npm start
 发布集只由**本批次成功条目**构成，且发布闸门要求整批 `completed`。
 分页失败/换版时作业进入 `failed/edition_changed`，发布被拒绝，当前生效发布保持不变，
 因此缺采只会阻断发布，绝不会把缺失数据写成"删除"。
+
+## 设计说明：定时采集、同源并发限制与失联接管
+
+两个实例共用同一份存储（嵌入式文件存储或 PostgreSQL）时，按"来源租约 + 围栏令牌"协同：
+
+- **轮次（round）锚定作业**：每次定时到点开一轮（`<sourceId>#r<n>`），轮次写入 `CrawlJob.round`。
+  同轮内无论谁推进都落在**同一作业**上；接管与手动续跑复用该轮，因此检查点（已确认页快照）天然沿用、不重抓。
+- **同轮只启动一次**：`acquireLease` 在嵌入式存储用进程内互斥 + `mkdir` 锁文件、PG 用 `SELECT … FOR UPDATE`
+  行锁串行化竞争。活跃且未超时的租约被他人请求时返回 `busy`（HTTP 409），手动续跑走同一套限制。
+- **心跳与接管**：运行方每推进一个检查点步长前刷新心跳 `heartbeatAtMs`。
+  超过 `takeoverTimeoutMs` 未心跳即判失联，另一实例的 tick 接管该租约——保留 `round/jobId`、
+  规则版本与全部已确认页检查点，从首个未完成条目继续。
+- **围栏防迟到写入**：易主或换轮时 `fencingToken` 递增。`saveJob` 携带 `(ownerId, fencingToken)`，
+  存储层校验当前活跃租约；旧实例恢复后的迟到结果与心跳抛 `LeaseLostError`（HTTP 410），不能改写新进度。
+  嵌入式存储另有进程内围栏视图，失效 owner 在争抢锁文件前即被快速拒绝。
+- **来源隔离**：调度器为每个来源维护独立异步链（`inflight`），一个来源的请求挂起只停在自己的链上，
+  其他来源照常到点采集。
+- **自动不发布**：调度器只负责把作业推进到 `completed/failed/edition_changed` 并释放租约；
+  发布始终走 `/api/publish` 人工闸门。失败作业带退避时间，避免故障期空转（手动续跑忽略退避）。
+
+时序相关逻辑由 `Clock` 抽象承载：生产用 `SystemClock`，离线测试用 `VirtualClock`
+确定性推进时间，无需真实等待即可复现"失联 → 超时 → 接管"。

@@ -17,6 +17,7 @@ import type {
   BusinessRecord,
   CrawlJob,
   JobEntryState,
+  JobFence,
   RuleDocument,
   Snapshot,
   Store,
@@ -27,13 +28,28 @@ export interface StartJobInput {
   seedUrl: string;
   rule: RuleDocument;
   expectedRevision?: string;
+  /** 定时采集轮次：写入新作业；续跑已有作业时沿用其轮次 */
+  round?: string | null;
 }
 
 export class CrawlService {
+  /** 写作业时的围栏（来自当前来源租约）；未设置时为无围栏的本地/手动路径 */
+  private fence: JobFence | null = null;
+  /** 租约是否仍有效的协同检查钩子（调度器注入），在每个检查点步长前求值 */
+  private leaseValid: (() => Promise<void>) | null = null;
+
   constructor(
     private readonly store: Store,
     private readonly fetcher: Fetcher,
   ) {}
+
+  /** 绑定租约围栏与失联检查，返回新实例（不可变绑定，避免串租约） */
+  withFence(fence: JobFence, leaseValid: () => Promise<void>): CrawlService {
+    const bound = new CrawlService(this.store, this.fetcher);
+    bound.fence = fence;
+    bound.leaseValid = leaseValid;
+    return bound;
+  }
 
   /** 启动新作业；若存在同来源同规则的未完成作业，直接返回它（重启续跑入口） */
   async startOrResume(input: StartJobInput): Promise<CrawlJob> {
@@ -48,6 +64,7 @@ export class CrawlService {
       seedUrl: input.seedUrl,
       ruleId: input.rule.ruleId,
       ruleVersion: input.rule.version,
+      round: input.round ?? null,
       expectedRevision: revision,
       status: 'running',
       listSnapshotIds: [],
@@ -58,8 +75,13 @@ export class CrawlService {
       lastError: null,
       publicationId: null,
     };
-    await this.store.saveJob(job);
+    await this.store.saveJob(job, this.fence ?? undefined);
     return job;
+  }
+
+  /** 公开的续跑作业查询（调度器判断是否同轮复用同一作业） */
+  findResumableJob(sourceId: string, ruleId: string, ruleVersion: string): Promise<CrawlJob | null> {
+    return this.findResumable(sourceId, ruleId, ruleVersion);
   }
 
   private async findResumable(sourceId: string, ruleId: string, ruleVersion: string): Promise<CrawlJob | null> {
@@ -92,7 +114,7 @@ export class CrawlService {
         job.status = 'failed';
         job.lastError = `列表发现失败: ${(e as Error).message}`;
         job.updatedAt = nowIso();
-        await this.store.saveJob(job);
+        await this.store.saveJob(job, this.fence ?? undefined);
         return job;
       }
     }
@@ -103,10 +125,12 @@ export class CrawlService {
     for (const entry of job.entries) {
       if (entry.status === 'done') continue;
       if (processed >= budget) break;
+      // 每个条目推进前确认租约仍在自己手里；失联/被接管则立即停手（写保护由围栏兜底）
+      if (this.leaseValid) await this.leaseValid();
       processed += 1;
       await this.crawlEntry(job, rule, entry);
       if (job.status === 'edition_changed') {
-        await this.store.saveJob(job);
+        await this.store.saveJob(job, this.fence ?? undefined);
         return job;
       }
     }
@@ -120,7 +144,7 @@ export class CrawlService {
       job.status = 'failed';
       job.lastError = job.lastError ?? '存在失败条目，批次不完整';
     }
-    await this.store.saveJob(job);
+    await this.store.saveJob(job, this.fence ?? undefined);
     return job;
   }
 
@@ -153,7 +177,7 @@ export class CrawlService {
       }
       if (!rule.list?.pagination) break;
       listUrl = extractNextPage(snap.html, rule.list.pagination, listUrl);
-      await this.store.saveJob(job);
+      await this.store.saveJob(job, this.fence ?? undefined);
     }
   }
 
@@ -181,7 +205,7 @@ export class CrawlService {
         const snap = await this.persistSnapshot(job, fetched, nextUrl);
         if (!entry.snapshotIds.includes(snap.snapshotId)) entry.snapshotIds.push(snap.snapshotId);
         pages.push({ url: nextUrl, html: snap.html, page: pages.length + 1 });
-        await this.store.saveJob(job); // 每页落检查点
+        await this.store.saveJob(job, this.fence ?? undefined); // 每页落检查点（带围栏）
         nextUrl = rule.pagination ? extractNextPage(snap.html, rule.pagination, nextUrl) : null;
       }
 
@@ -202,7 +226,7 @@ export class CrawlService {
     }
     entry.updatedAt = nowIso();
     job.updatedAt = nowIso();
-    await this.store.saveJob(job);
+    await this.store.saveJob(job, this.fence ?? undefined);
   }
 
   private nextUrlOf(rule: RuleDocument, lastPage: PageDocument): string | null {

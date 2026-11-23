@@ -9,7 +9,7 @@
   },
   "scripts": {
     "demo": "tsx src/demo/run-demo.ts",
-    "test": "node --import tsx --test tests/normalize.test.ts tests/engine.test.ts tests/workflow.test.ts",
+    "test": "node --import tsx --test tests/normalize.test.ts tests/engine.test.ts tests/workflow.test.ts tests/scheduler.test.ts tests/http-schedule.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "start": "tsx src/server/index.ts",

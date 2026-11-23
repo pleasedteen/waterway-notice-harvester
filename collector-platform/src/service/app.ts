@@ -6,8 +6,10 @@ import { EmbeddedStore } from '../storage/embedded-store.js';
 import { CrawlService } from './crawl-service.js';
 import { RegressionService } from './regression-service.js';
 import { PublishService } from './publish-service.js';
+import { SchedulerService } from './scheduler-service.js';
 import { RULE_V1, RULE_V2, RULE_REGRESSED } from '../core/rule-catalog.js';
 import { newId, nowIso } from '../core/ids.js';
+import type { Clock } from '../core/clock.js';
 import type { Fetcher } from '../fetch/fetcher.js';
 import type { RuleDocument, Snapshot, Store } from '../core/types.js';
 
@@ -16,20 +18,38 @@ export interface App {
   crawl: CrawlService;
   regression: RegressionService;
   publish: PublishService;
+  scheduler: SchedulerService;
 }
 
-export async function createApp(opts: { dataDir: string; fetcher: Fetcher; store?: Store }): Promise<App> {
+export async function createApp(opts: {
+  dataDir: string;
+  fetcher: Fetcher;
+  store?: Store;
+  clock?: Clock;
+  instanceId?: string;
+  /** 调度器按来源构造抓取器；缺省每个来源复用一份与 opts.fetcher 同构的新抓取器 */
+  fetcherFactory?: (sourceId: string) => Fetcher;
+  autoStartScheduler?: boolean;
+}): Promise<App> {
   const store = opts.store ?? new EmbeddedStore(opts.dataDir);
   await store.init();
   // 内置规则版本入库（不可变；重复保存同内容是幂等的）
   for (const r of [RULE_V1, RULE_V2, RULE_REGRESSED]) {
     await store.saveRule(r);
   }
+  const scheduler = new SchedulerService({
+    store,
+    clock: opts.clock,
+    instanceId: opts.instanceId,
+    fetcherFactory: opts.fetcherFactory ?? (() => opts.fetcher),
+  });
+  if (opts.autoStartScheduler !== false) scheduler.start();
   return {
     store,
     crawl: new CrawlService(store, opts.fetcher),
     regression: new RegressionService(store),
     publish: new PublishService(store),
+    scheduler,
   };
 }
 

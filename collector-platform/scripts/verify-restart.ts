@@ -8,8 +8,8 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-const PORT = 8137;
-const BASE = `http://localhost:${PORT}`;
+const PORT = Number(process.env.RESTART_TEST_PORT ?? 8137);
+const BASE = `http://127.0.0.1:${PORT}`;
 const dataDir = await mkdtemp(join(tmpdir(), 'collector-restart-'));
 
 function startServer(): ReturnType<typeof spawn> {
@@ -42,7 +42,8 @@ try {
   // 第一次进程
   let srv = startServer();
   await waitReady();
-  const job = await post('/api/jobs/start', { ruleId: 'rule-mock-notice', version: '1.0.0', sourceId: 'mock-source', useMock: true });
+  const startResp = await post('/api/jobs/start', { ruleId: 'rule-mock-notice', version: '1.0.0', sourceId: 'mock-source', useMock: true });
+  const job = startResp.job ?? startResp; // 新版返回 { outcome, job, lease }
   await post(`/api/jobs/${job.jobId}/run`, { maxEntriesPerCall: 1 });
   const midway = await (await fetch(`${BASE}/api/jobs/${job.jobId}`)).json();
   check('强杀前完成 1/4 条目', midway.entries.filter((e: any) => e.status === 'done').length === 1);
@@ -52,12 +53,13 @@ try {
   // 第二次进程：仅靠磁盘检查点恢复
   srv = startServer();
   await waitReady();
-  const resumed = await post('/api/jobs/start', { ruleId: 'rule-mock-notice', version: '1.0.0', sourceId: 'mock-source', useMock: true });
+  const resumedResp = await post('/api/jobs/start', { ruleId: 'rule-mock-notice', version: '1.0.0', sourceId: 'mock-source', useMock: true });
+  const resumed = resumedResp.job ?? resumedResp; // 兼容 StepResult 包装
   check('重启后回到同一作业（未新建）', resumed.jobId === job.jobId);
   let status = 'running';
   for (let i = 0; i < 8; i += 1) {
     const r = await post(`/api/jobs/${job.jobId}/run`, {});
-    status = r.status;
+    status = (r.job ?? r).status;
     if (status !== 'running' && status !== 'failed') break;
   }
   check('重启续跑后整批 completed', status === 'completed', status);

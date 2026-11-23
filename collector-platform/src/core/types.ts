@@ -173,6 +173,14 @@ export interface Snapshot {
 
 export type JobStatus = 'running' | 'completed' | 'failed' | 'edition_changed' | 'aborted';
 
+/** 作业已进入空闲态（不再占用来源租约），running 之外均视为空闲 */
+export const IDLE_JOB_STATUSES: ReadonlySet<JobStatus> = new Set([
+  'completed',
+  'failed',
+  'edition_changed',
+  'aborted',
+]);
+
 export interface JobEntryState {
   entryUrl: string;
   /** 列表页预取字段（JSON 化） */
@@ -193,6 +201,8 @@ export interface CrawlJob {
   seedUrl: string;
   ruleId: string;
   ruleVersion: string;
+  /** 定时采集轮次：同一轮内两个实例只推进同一作业；手动/接管续跑沿用同一轮 */
+  round: string | null;
   /** 启动时观察到的来源修订；中途发现不同修订 => edition_changed */
   expectedRevision: string;
   status: JobStatus;
@@ -322,6 +332,70 @@ export interface SourceConfig {
   seedUrl: string;
 }
 
+/* --------------------- 按来源定时采集配置 --------------------- */
+
+export interface ScheduleConfig {
+  sourceId: string;
+  name: string;
+  seedUrl: string;
+  /** 定时采集使用的规则标识与版本（规则版本不可变，作业固定在该版本上） */
+  ruleId: string;
+  ruleVersion: string;
+  /** 采集间隔毫秒；到点由调度器自动推进作业，发布仍需人工确认 */
+  intervalMs: number;
+  /** 推进实例失联判定时限：超过该时长没有心跳即可被另一实例接管 */
+  takeoverTimeoutMs: number;
+  /** 单次 run 调用最多推进的条目数（缺省由作业自行决定） */
+  maxEntriesPerCall?: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  /** 最近一次到点触发时间（含接管检查的 tick），用于间隔门控 */
+  lastTriggeredAt: string | null;
+}
+
+/* --------------------- 来源租约（同源并发限制 + 接管） --------------------- */
+
+export type LeaseState = 'active' | 'released';
+
+export interface SourceLease {
+  sourceId: string;
+  /** 该来源当前轮次标识（同轮只启动一次作业；接管沿用同一轮） */
+  round: string;
+  /** 当前持有实例 */
+  ownerId: string;
+  /** 围栏令牌：易主/换轮即递增；saveJob 携带令牌做写保护，迟到写入被拒 */
+  fencingToken: number;
+  state: LeaseState;
+  /** 租约创建时间（epoch ms） */
+  createdAtMs: number;
+  /** 最近一次心跳时间（epoch ms）；now - heartbeatAt > takeoverTimeoutMs 即可接管 */
+  heartbeatAtMs: number;
+  /** 该轮次对应的作业（首次 run 后回填） */
+  jobId: string | null;
+  /** 释放原因（state=released 时有值） */
+  releaseReason: string | null;
+  /** 失败作业的退避截止时间（epoch ms）；到期前调度器不重新获取租约，手动续跑不受限 */
+  availableAfterMs: number | null;
+  updatedAt: string;
+}
+
+/** 租约获取结果 */
+export type LeaseAcquireMode = 'acquired' | 'renewed' | 'taken_over' | 'busy';
+
+export interface LeaseAcquireResult {
+  mode: LeaseAcquireMode;
+  lease: SourceLease | null;
+  /** busy 时当前持有者，便于调用方判断 */
+  busyOwnerId?: string;
+}
+
+/** saveJob 的围栏参数：必须与当前活跃租约的 owner/token 完全一致才允许写入 */
+export interface JobFence {
+  ownerId: string;
+  fencingToken: number;
+}
+
 /* ----------------------------- 存储抽象 ----------------------------- */
 
 export interface Store {
@@ -340,9 +414,46 @@ export interface Store {
   getFixture(fixtureId: string): Promise<RegressionFixture | null>;
   listFixtures(): Promise<RegressionFixture[]>;
 
-  saveJob(job: CrawlJob): Promise<void>;
+  saveJob(job: CrawlJob, fence?: JobFence): Promise<void>;
   getJob(jobId: string): Promise<CrawlJob | null>;
   listJobs(): Promise<CrawlJob[]>;
+
+  /* 定时配置 */
+  saveSchedule(schedule: ScheduleConfig): Promise<void>;
+  getSchedule(sourceId: string): Promise<ScheduleConfig | null>;
+  listSchedules(): Promise<ScheduleConfig[]>;
+  /** 仅更新最近触发时间（到点门控） */
+  touchSchedule(sourceId: string, lastTriggeredAt: string): Promise<void>;
+
+  /* 来源租约：跨实例同源并发限制与接管 */
+  /**
+   * 原子获取/续期/接管租约：
+   *  - 无租约或已释放 => 以 requestedRound 新建（acquired）；
+   *  - 活跃且持有者为自己且同轮 => 续期（renewed）；
+   *  - 活跃但心跳超时 => 接管（taken_over，fencingToken 递增、owner 更换）；
+   *  - 活跃且未超时且持有者非自己 => busy。
+   * 进程内串行 + 嵌入式锁文件 / PG 行锁保证两个实例竞争时只有一个成功。
+   */
+  acquireLease(input: {
+    sourceId: string;
+    ownerId: string;
+    requestedRound: string;
+    nowMs: number;
+    takeoverTimeoutMs: number;
+  }): Promise<LeaseAcquireResult>;
+  /** 心跳：仅 owner/token 匹配且仍活跃时更新 heartbeatAtMs，否则抛 LeaseLostError */
+  heartbeatLease(sourceId: string, fence: JobFence, nowMs?: number): Promise<SourceLease>;
+  /** 回填作业 id（同样做 owner/token 校验） */
+  attachJobToLease(sourceId: string, fence: JobFence, jobId: string): Promise<void>;
+  /** 释放租约（owner/token 校验；可携带退避时间） */
+  releaseLease(
+    sourceId: string,
+    fence: JobFence,
+    reason: string,
+    nowMs?: number,
+    availableAfterMs?: number | null,
+  ): Promise<void>;
+  getLease(sourceId: string): Promise<SourceLease | null>;
 
   saveRegressionReport(report: RegressionReport): Promise<void>;
   getRegressionReport(reportId: string): Promise<RegressionReport | null>;

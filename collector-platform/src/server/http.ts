@@ -7,9 +7,8 @@ import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { App } from '../service/app.js';
-import { HttpFetcher } from '../fetch/fetcher.js';
-import { CrawlService } from '../service/crawl-service.js';
-import { MockFetcher, createMockState, MOCK_URLS } from '../mock/site.js';
+import { MOCK_URLS } from '../mock/site.js';
+import { LeaseBusyError, LeaseLostError } from '../core/errors.js';
 import type { RuleDocument } from '../core/types.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -30,11 +29,13 @@ async function readBody(req: IncomingMessage): Promise<any> {
   }
 }
 
-export function createHttpServer(app: App, opts: { port: number; mockState?: ReturnType<typeof createMockState> }): Server {
+export function createHttpServer(app: App, opts: { port: number; mockState?: unknown }): Server {
   const server = createServer(async (req, res) => {
     try {
       await route(req, res);
     } catch (e) {
+      if (e instanceof LeaseBusyError) return send(res, 409, { error: e.message, busyOwnerId: e.busyOwnerId });
+      if (e instanceof LeaseLostError) return send(res, 410, { error: e.message });
       send(res, 500, { error: (e as Error).message });
     }
   });
@@ -103,25 +104,87 @@ export function createHttpServer(app: App, opts: { port: number; mockState?: Ret
       const body = await readBody(req);
       const rule = await app.store.getRule(body.ruleId, body.version);
       if (!rule) return send(res, 404, { error: '规则版本不存在' });
-      const fetcher = body.useMock
-        ? new MockFetcher(opts.mockState ?? createMockState())
-        : new HttpFetcher();
-      const crawl = new CrawlService(app.store, fetcher);
-      const job = await crawl.startOrResume({
-        sourceId: body.sourceId ?? 'mock-source',
-        seedUrl: body.seedUrl ?? MOCK_URLS.list,
-        rule,
-      });
-      return send(res, 201, job);
+      const sourceId = body.sourceId ?? 'mock-source';
+      const seedUrl = body.seedUrl ?? MOCK_URLS.list;
+      // 人工启动同样经过来源租约：同来源同轮只允许一个实例推进
+      const step = await app.scheduler.manualStart({ sourceId, seedUrl, rule });
+      return send(res, 201, step);
     }
     if (p.match(/^\/api\/jobs\/[^/]+\/run$/) && method === 'POST') {
       const jobId = p.split('/')[3]!;
       const body = await readBody(req).catch(() => ({}));
-      // 续跑沿用启动时的抓取器（演示用 mock；生产中 fetcher 注入由进程配置决定）
-      const fetcher = new MockFetcher(opts.mockState ?? createMockState());
-      const crawl = new CrawlService(app.store, fetcher);
-      const job = await crawl.run(jobId, { maxEntriesPerCall: body.maxEntriesPerCall });
-      return send(res, 200, job);
+      // 手动续跑遵守同源并发限制：租约被其他实例持有且未到接管时限 => 409
+      const step = await app.scheduler.manualRunStep(jobId, body.maxEntriesPerCall);
+      return send(res, 200, step);
+    }
+
+    /* ---------------- 按来源定时采集 ---------------- */
+    if (p === '/api/schedules' && method === 'GET') {
+      return send(res, 200, await app.store.listSchedules());
+    }
+    if (p.match(/^\/api\/schedules\/[^/]+$/) && method === 'GET') {
+      const sourceId = decodeURIComponent(p.split('/').pop()!);
+      const s = await app.store.getSchedule(sourceId);
+      return send(res, s ? 200 : 404, s ?? { error: '定时配置不存在' });
+    }
+    if (p === '/api/schedules' && method === 'POST') {
+      const body = await readBody(req);
+      const schedule = await app.scheduler.upsertSchedule({
+        sourceId: body.sourceId,
+        name: body.name ?? body.sourceId,
+        seedUrl: body.seedUrl ?? MOCK_URLS.list,
+        ruleId: body.ruleId,
+        ruleVersion: body.version ?? body.ruleVersion,
+        intervalMs: Number(body.intervalMs),
+        takeoverTimeoutMs: Number(body.takeoverTimeoutMs),
+        maxEntriesPerCall: body.maxEntriesPerCall,
+        enabled: body.enabled,
+      });
+      return send(res, 201, schedule);
+    }
+    if (p.match(/^\/api\/schedules\/[^/]+$/) && method === 'PUT') {
+      const sourceId = decodeURIComponent(p.split('/').pop()!);
+      const old = await app.store.getSchedule(sourceId);
+      if (!old) return send(res, 404, { error: '定时配置不存在' });
+      const body = await readBody(req);
+      const schedule = await app.scheduler.upsertSchedule({
+        sourceId,
+        name: body.name ?? old.name,
+        seedUrl: body.seedUrl ?? old.seedUrl,
+        ruleId: body.ruleId ?? old.ruleId,
+        ruleVersion: body.version ?? body.ruleVersion ?? old.ruleVersion,
+        intervalMs: body.intervalMs !== undefined ? Number(body.intervalMs) : old.intervalMs,
+        takeoverTimeoutMs:
+          body.takeoverTimeoutMs !== undefined ? Number(body.takeoverTimeoutMs) : old.takeoverTimeoutMs,
+        maxEntriesPerCall: body.maxEntriesPerCall ?? old.maxEntriesPerCall,
+        enabled: body.enabled ?? old.enabled,
+      });
+      return send(res, 200, schedule);
+    }
+    if (p.match(/^\/api\/schedules\/[^/]+\/enabled$/) && method === 'POST') {
+      const sourceId = decodeURIComponent(p.split('/')[3]!);
+      const body = await readBody(req);
+      return send(res, 200, await app.scheduler.setEnabled(sourceId, Boolean(body.enabled)));
+    }
+    if (p.match(/^\/api\/schedules\/[^/]+\/tick$/) && method === 'POST') {
+      // 手动触发一次调度评估（测试/运维用）：受间隔门控与租约限制
+      const sourceId = decodeURIComponent(p.split('/')[3]!);
+      const s = await app.store.getSchedule(sourceId);
+      if (!s) return send(res, 404, { error: '定时配置不存在' });
+      await app.scheduler.tick();
+      return send(res, 200, { triggered: true, schedule: await app.store.getSchedule(sourceId) });
+    }
+    if (p.match(/^\/api\/leases\/[^/]+$/) && method === 'GET') {
+      const sourceId = decodeURIComponent(p.split('/').pop()!);
+      const lease = await app.store.getLease(sourceId);
+      return send(res, lease ? 200 : 404, lease ?? { error: '租约不存在' });
+    }
+    if (p === '/api/leases' && method === 'GET') {
+      const sourceIds = (await app.store.listSchedules()).map((s) => s.sourceId);
+      const leases = (
+        await Promise.all(sourceIds.map(async (id) => [id, await app.store.getLease(id)] as const))
+      ).filter(([, l]) => l !== null).map(([, l]) => l);
+      return send(res, 200, leases);
     }
 
     if (p === '/api/publish/evaluate' && method === 'POST') {
