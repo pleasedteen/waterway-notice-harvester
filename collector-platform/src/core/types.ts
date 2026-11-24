@@ -173,16 +173,55 @@ export interface Snapshot {
 
 export type JobStatus = 'running' | 'completed' | 'failed' | 'edition_changed' | 'aborted';
 
+/**
+ * 一次页面处理尝试的结局（值班员可据此区分重新请求 / 复用快照 / 失败）：
+ * - fetched：本次真的发出请求并成功落盘快照；
+ * - reused ：本次未发请求，直接复用已落盘的检查点快照；
+ * - failed ：本次请求失败（网络/解析），无新快照；
+ * - in_flight：尝试已登记但结局未知（典型为请求途中进程被强杀，重启后该记录永不被改写）。
+ */
+export type PageAttemptOutcome = 'fetched' | 'reused' | 'failed' | 'in_flight';
+
+/**
+ * 页面级尝试诊断（append-only）。每次列表/详情页处理只新增一条，
+ * 单条记录不可变（in_flight 的旧尝试在重启后保持原状，新尝试另写新行），
+ * 因此单次推进的诊断写入量只取决于本次触及的页面数，与历史尝试次数无关。
+ */
+export interface PageAttempt {
+  /** 尝试唯一标识（进程重启后仍可凭它区分旧尝试与新尝试） */
+  attemptId: string;
+  jobId: string;
+  /** 列表页为 list；详情页为 detail */
+  kind: 'list' | 'detail';
+  /** detail 页所属条目入口 URL；list 页为 null */
+  entryUrl: string | null;
+  /** 逻辑页码（1 基） */
+  page: number;
+  url: string;
+  outcome: PageAttemptOutcome;
+  /** fetched 成功并已落盘的快照 id；其余结局为 null */
+  snapshotId: string | null;
+  /** 失败原因或 in_flight 说明，成功/复用为 null */
+  error: string | null;
+  /** 尝试开始（登记）时间 */
+  startedAt: string;
+  /** 结局落定时间；in_flight 永远为 null */
+  finishedAt: string | null;
+}
+
 export interface JobEntryState {
   entryUrl: string;
   /** 列表页预取字段（JSON 化） */
   prefetch: Record<string, ExtractedField>;
   status: 'pending' | 'done' | 'failed';
-  /** 已抓取快照 id（按页序） */
+  /** 已抓取快照 id（按页序，检查点；只有这里出现的页面才算采集成功） */
   snapshotIds: string[];
   pagesMerged: number[];
   record: BusinessRecord | null;
+  /** 条目级尝试次数（历史计数，仅用于展示；页面级明细见 PageAttempt） */
   attempts: number;
+  /** 已为该条目的落盘快照写过 reused 尝试（断点续跑只记一次，避免重复推进产生重复诊断） */
+  reuseLogged?: boolean;
   lastError: string | null;
   updatedAt: string;
 }
@@ -199,6 +238,10 @@ export interface CrawlJob {
   /** 列表页快照 id（检查点，不参与详情合并） */
   listSnapshotIds: string[];
   entries: JobEntryState[];
+  /** 列表发现是否已完整跑完（断点续跑时据此跳过列表阶段，直接复用列表快照） */
+  listDiscoveryDone?: boolean;
+  /** 已为已落盘列表快照写过 reused 尝试（续跑只记一次，避免重复推进产生重复诊断） */
+  listReuseLogged?: boolean;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
@@ -343,6 +386,14 @@ export interface Store {
   saveJob(job: CrawlJob): Promise<void>;
   getJob(jobId: string): Promise<CrawlJob | null>;
   listJobs(): Promise<CrawlJob[]>;
+
+  /**
+   * 页面尝试诊断（append-only 语义）：
+   * 同一 attemptId 首次写入即不可变——in_flight 记录在重启后不会被覆盖，
+   * 结局落定时写的是同一个 attemptId 的终态（先登记后终态，每条尝试至多两份物理写）。
+   */
+  savePageAttempt(attempt: PageAttempt): Promise<void>;
+  listPageAttempts(jobId: string): Promise<PageAttempt[]>;
 
   saveRegressionReport(report: RegressionReport): Promise<void>;
   getRegressionReport(reportId: string): Promise<RegressionReport | null>;

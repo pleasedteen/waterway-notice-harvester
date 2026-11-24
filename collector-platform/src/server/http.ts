@@ -94,9 +94,18 @@ export function createHttpServer(app: App, opts: { port: number; mockState?: Ret
     }
 
     if (p === '/api/jobs' && method === 'GET') return send(res, 200, await app.store.listJobs());
+    if (p.match(/^\/api\/jobs\/[^/]+\/attempts$/) && method === 'GET') {
+      const jobId = p.split('/')[3]!;
+      const exists = await app.store.getJob(jobId);
+      if (!exists) return send(res, 404, { error: '作业不存在' });
+      return send(res, 200, await app.store.listPageAttempts(jobId));
+    }
     if (p.startsWith('/api/jobs/') && method === 'GET') {
-      const j = await app.store.getJob(p.split('/').pop()!);
-      return send(res, j ? 200 : 404, j ?? { error: '作业不存在' });
+      const jobId = p.split('/').pop()!;
+      const j = await app.store.getJob(jobId);
+      if (!j) return send(res, 404, { error: '作业不存在' });
+      // 详情页附带页面尝试诊断：值班员可识别每次尝试的结局与页面地址
+      return send(res, 200, { ...j, pageAttempts: await app.store.listPageAttempts(jobId) });
     }
 
     if (p === '/api/jobs/start' && method === 'POST') {

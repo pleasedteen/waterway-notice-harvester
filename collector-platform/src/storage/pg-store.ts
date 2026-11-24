@@ -13,6 +13,7 @@ import type {
   Publication,
   SourceConfig,
   BusinessRecord,
+  PageAttempt,
 } from '../core/types.js';
 
 export class PostgresStore implements Store {
@@ -50,6 +51,11 @@ export class PostgresStore implements Store {
       CREATE TABLE IF NOT EXISTS sources (
         source_id TEXT PRIMARY KEY, doc JSONB NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS page_attempts (
+        attempt_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, doc JSONB NOT NULL,
+        started_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_page_attempts_job ON page_attempts (job_id, started_at);
     `);
   }
 
@@ -135,6 +141,28 @@ export class PostgresStore implements Store {
   }
   async listJobs(): Promise<CrawlJob[]> {
     const r = await this.pool.query<{ doc: CrawlJob }>(`SELECT doc FROM jobs ORDER BY updated_at DESC`);
+    return r.rows.map((x) => x.doc);
+  }
+
+  /**
+   * 尝试诊断 append-only：新尝试插入；只有仍处 in_flight 的同一尝试可落定终态，
+   * 已终态的历史行与重启后遗留的 in_flight 旧尝试都不会被改写。
+   */
+  async savePageAttempt(a: PageAttempt): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO page_attempts (attempt_id, job_id, doc, started_at) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (attempt_id) DO UPDATE
+       SET doc = EXCLUDED.doc, started_at = EXCLUDED.started_at
+       WHERE page_attempts.doc->>'outcome' = 'in_flight'`,
+      [a.attemptId, a.jobId, JSON.stringify(a), a.startedAt],
+    );
+  }
+
+  async listPageAttempts(jobId: string): Promise<PageAttempt[]> {
+    const r = await this.pool.query<{ doc: PageAttempt }>(
+      `SELECT doc FROM page_attempts WHERE job_id=$1 ORDER BY started_at, attempt_id`,
+      [jobId],
+    );
     return r.rows.map((x) => x.doc);
   }
 

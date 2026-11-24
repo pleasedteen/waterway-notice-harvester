@@ -14,6 +14,7 @@ import type {
   RegressionReport,
   Publication,
   SourceConfig,
+  PageAttempt,
 } from '../core/types.js';
 
 export class EmbeddedStore implements Store {
@@ -28,7 +29,7 @@ export class EmbeddedStore implements Store {
   }
 
   async init(): Promise<void> {
-    for (const d of ['rules', 'snapshots', 'fixtures', 'jobs', 'reports', 'publications', 'sources', 'meta']) {
+    for (const d of ['rules', 'snapshots', 'fixtures', 'jobs', 'reports', 'publications', 'sources', 'meta', 'attempts']) {
       await mkdir(join(this.root, d), { recursive: true });
     }
   }
@@ -112,6 +113,27 @@ export class EmbeddedStore implements Store {
   }
   listJobs(): Promise<CrawlJob[]> {
     return this.listJson<CrawlJob>('jobs');
+  }
+
+  /**
+   * 页面尝试只追加不改写历史：终态与登记态共用同一文件名（同一 attemptId 的两份原子写），
+   * 重启产生的新尝试永远使用新 attemptId/新文件，因此旧的 in_flight 记录原样保留。
+   */
+  async savePageAttempt(a: PageAttempt): Promise<void> {
+    await this.atomicWriteJson(join(this.dir('attempts'), `${a.jobId}__${a.attemptId}.json`), a);
+  }
+
+  async listPageAttempts(jobId: string): Promise<PageAttempt[]> {
+    const dir = this.dir('attempts');
+    if (!existsSync(dir)) return [];
+    const files = (await readdir(dir)).filter((f) => f.startsWith(`${jobId}__`) && f.endsWith('.json'));
+    const out: PageAttempt[] = [];
+    for (const f of files) {
+      const v = await this.readJson<PageAttempt>(join(dir, f));
+      if (v) out.push(v);
+    }
+    // 先按开始时间，再按尝试 id：同一时刻（强杀前后）也能稳定区分新旧尝试
+    return out.sort((a, b) => a.startedAt.localeCompare(b.startedAt) || a.attemptId.localeCompare(b.attemptId));
   }
 
   async saveRegressionReport(r: RegressionReport): Promise<void> {

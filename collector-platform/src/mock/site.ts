@@ -16,6 +16,8 @@ export interface MockState {
   requests: number;
   /** 达到该请求数后自动切到 v2（模拟采集中换版） */
   switchAfter: number | null;
+  /** slow 故障的挂起时长（毫秒），默认 10 分钟：足以在请求途中强杀进程 */
+  slowDelayMs?: number;
 }
 
 export function createMockState(): MockState {
@@ -239,6 +241,10 @@ export class MockFetcher implements Fetcher {
     if (faultKey) {
       const kind = this.state.faults.get(faultKey)!;
       if (kind === 'error') throw new Error(`模拟网络故障: ${url}`);
+      if (kind === 'slow') {
+        // 请求挂起：模拟"请求途中"，外部可在此窗口内强杀进程
+        await new Promise<void>((resolve) => setTimeout(resolve, this.state.slowDelayMs ?? 600_000));
+      }
       if (kind === 'garbled') {
         return { url, statusCode: 200, contentType: 'text/html', html: '<html><body>@@@乱码@@@', revision: 'garbled' };
       }

@@ -9,12 +9,13 @@
   },
   "scripts": {
     "demo": "tsx src/demo/run-demo.ts",
-    "test": "node --import tsx --test tests/normalize.test.ts tests/engine.test.ts tests/workflow.test.ts",
+    "test": "node --import tsx --test tests/normalize.test.ts tests/engine.test.ts tests/workflow.test.ts tests/page-attempts.test.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc",
     "start": "tsx src/server/index.ts",
     "mock": "tsx src/mock/site.ts",
-    "verify:restart": "tsx scripts/verify-restart.ts"
+    "verify:restart": "tsx scripts/verify-restart.ts",
+    "verify:kill": "tsx scripts/verify-kill.ts"
   },
   "dependencies": {
     "node-html-parser": "^7.0.1",

@@ -17,6 +17,14 @@ async function main(): Promise<void> {
   const pgConn = process.env.PG_CONNECTION_STRING;
 
   const mockState = createMockState();
+  // 可选故障注入（验证用，模拟站点内生效）：MOCK_FAULTS="G2026-021:slow,G2026-018?page=2:error"
+  for (const item of (process.env.MOCK_FAULTS ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    const [urlPart, kind] = item.split(':');
+    if (urlPart && (kind === 'error' || kind === 'slow' || kind === 'garbled')) {
+      mockState.faults.set(urlPart, kind);
+    }
+  }
+  if (process.env.MOCK_SLOW_DELAY_MS) mockState.slowDelayMs = Number(process.env.MOCK_SLOW_DELAY_MS);
   let store: Store = new EmbeddedStore(dataDir);
   if (pgConn) {
     const [{ PostgresStore }, { default: pg }] = await Promise.all([

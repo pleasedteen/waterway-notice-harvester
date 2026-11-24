@@ -34,6 +34,9 @@
   .b-running { background:#e3effd; color:var(--pri); }
   .b-completed { background:#e6f6ee; color:var(--ok); }
   .b-failed,.b-edition_changed { background:#fde8e6; color:var(--err); }
+  .b-fetched { background:#e6f6ee; color:var(--ok); }
+  .b-reused { background:#e3effd; color:var(--pri); }
+  .b-in_flight { background:#fff4e0; color:var(--warn); }
   .muted { color:var(--muted); font-size:12px; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:10px; }
   input,select,textarea { font:inherit; padding:6px 9px; border:1px solid var(--bd); border-radius:6px; }
@@ -90,6 +93,10 @@
       <table><thead><tr><th>作业</th><th>状态</th><th>规则版本</th><th>来源修订</th><th>条目(完成/总数)</th><th>更新时间</th><th>操作</th></tr></thead>
       <tbody id="jobsBody"></tbody></table>
       <details style="margin-top:10px"><summary>作业详情 JSON</summary><pre id="jobDetail">点击"查看"加载</pre></details>
+      <details style="margin-top:10px" open><summary>页面尝试诊断（重新请求 / 复用快照 / 失败 / 结局未知）</summary>
+        <table style="margin-top:8px"><thead><tr><th>尝试ID</th><th>类型</th><th>结局</th><th>页码</th><th>页面地址</th><th>快照</th><th>开始时间</th><th>说明</th></tr></thead>
+        <tbody id="attemptsBody"><tr><td colspan="8" class="muted">点击作业行的"尝试"按钮加载</td></tr></tbody></table>
+      </details>
     </div>
   </section>
 
@@ -191,6 +198,7 @@ async function loadJobs() {
     <td>
       <button class="act" onclick="runJob('${j.jobId}')">续跑一步</button>
       <button class="act secondary" onclick="viewJob('${j.jobId}')">查看</button>
+      <button class="act secondary" onclick="loadAttempts('${j.jobId}')">尝试</button>
     </td></tr>`).join('');
   $('pubJob').innerHTML = jobs.map(j => `<option value="${j.jobId}">${j.jobId.slice(-8)} (${j.status})</option>`).join('');
 }
@@ -205,6 +213,20 @@ async function runJob(jobId) {
   if (job.status === 'running' || job.status === 'failed') console.log('作业仍可续跑:', job.status, job.lastError);
 }
 async function viewJob(jobId) { $('jobDetail').textContent = JSON.stringify(await api('/api/jobs/' + jobId), null, 2); }
+const outcomeText = { fetched:'重新请求成功', reused:'复用快照', failed:'请求失败', in_flight:'结局未知（中断）' };
+async function loadAttempts(jobId) {
+  const atts = await api(`/api/jobs/${jobId}/attempts`);
+  $('attemptsBody').innerHTML = atts.length ? atts.map(a => `<tr>
+    <td class="muted">${a.attemptId.slice(-8)}</td>
+    <td>${a.kind === 'list' ? '列表页' : '详情页'}</td>
+    <td><span class="badge b-${a.outcome}">${outcomeText[a.outcome] || a.outcome}</span></td>
+    <td>${a.page}</td>
+    <td>${a.url}${a.entryUrl ? '<div class="ev">条目: ' + a.entryUrl + '</div>' : ''}</td>
+    <td>${a.snapshotId ? a.snapshotId.slice(-8) : '<span class="muted">—</span>'}</td>
+    <td class="muted">${a.startedAt}</td>
+    <td class="ev">${a.error ?? (a.finishedAt ? '完成于 ' + a.finishedAt : '未落定')}</td>
+  </tr>`).join('') : '<tr><td colspan="8" class="muted">暂无尝试记录</td></tr>';
+}
 
 async function loadFixtures() {
   const fs = await api('/api/fixtures');

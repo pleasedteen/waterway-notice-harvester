@@ -8,8 +8,9 @@
 ```bash
 npm install
 npm run demo     # 端到端验收演示：50 项断言，覆盖全部要求场景（约 1 秒）
-npm test         # 22 个单元/集成测试（node:test，约 1 秒）
-npm run verify:restart  # 真实进程强杀后重启，验证检查点续跑（约 3 秒）
+npm test         # 28 个单元/集成测试（node:test，约 1 秒）
+npm run verify:restart  # 真实进程强杀后重启，验证检查点续跑与页面尝试诊断（约 3 秒）
+npm run verify:kill     # 请求途中强杀：in_flight 旧尝试与重启后新尝试可区分（约 5 秒）
 npm start        # 启动本地网页界面与 REST 接口：http://localhost:8080
 ```
 
@@ -33,6 +34,7 @@ npm start        # 启动本地网页界面与 REST 接口：http://localhost:80
 | 重放报告 | 新增/删除/字段变化/类型不兼容/新失败，逐条带原始网页证据（URL、选择器、表格行列、分页） |
 | 来源变化 vs 规则行为变化 | 四象限归因 `attributeChanges`：旧快照×新旧规则隔离规则侧，同规则×新旧快照隔离来源侧；对照存在失败时标 `undeterminable` |
 | 中断续跑 | 列表/条目/每页均落检查点（`CrawlService`）；重启后识别同来源同规则的未完成作业，复用已抓快照 |
+| 页面尝试诊断 | 每次列表/详情页处理写一条 append-only `PageAttempt`，区分 `fetched`（重新请求）/`reused`（复用快照）/`failed`（失败）/`in_flight`（强杀后结局未知），带页面地址与快照 id；写入量只与本次触及页面数有关，不随历史尝试次数增长 |
 | 采集中换版 | 来源修订（revision）逐页校验，不一致即 `edition_changed` 并阻断发布 |
 | 分页失败 | 已采页面保留、条目标 failed、批次不完整；"未采到"永不解释为删除 |
 | 发布闸门 | 仅 完整批次 + 同一来源修订 + 同一规则版本 + 回归通过 可发布；无夹具拒绝发布 |
@@ -122,7 +124,8 @@ tests/                  node:test 测试套件
 | `POST /api/regression/run` | 候选规则重放（`fixtureId` 单个，否则全部），返回 diff/归因/证据 |
 | `POST /api/jobs/start` | 启动或续跑作业（同来源同规则自动回到未完成作业） |
 | `POST /api/jobs/:id/run` | 推进一个检查点步长（可反复调用） |
-| `GET /api/jobs`, `GET /api/jobs/:id` | 作业与检查点详情 |
+| `GET /api/jobs`, `GET /api/jobs/:id` | 作业与检查点详情（详情响应内嵌 `pageAttempts` 页面尝试诊断） |
+| `GET /api/jobs/:id/attempts` | 该作业全部页面尝试（append-only，含强杀遗留的 `in_flight` 旧尝试） |
 | `POST /api/publish/evaluate` | 发布闸门评估（通过/拒绝原因/回归报告） |
 | `POST /api/publish` | 原子发布 |
 | `GET /api/publications`, `/api/publications/current` | 历史与当前生效发布 |
@@ -148,10 +151,48 @@ npm start
 - **G2026-030**：`0 吨` 零限值、明确无值、页面缺失字段（missing）；
 - **G2026-999**：身份字段缺失的记录级失败素材；
 - `edition v1 → v2`：A 公告限重真实变化（30t→28t），用于双变归因；
-- `switchAfter` 故障注入：采集中换版；`faults` 注入：分页抓取失败后恢复。
+- `switchAfter` 故障注入：采集中换版；`faults` 注入：分页抓取失败后恢复，`slow` 注入：请求挂起（用于请求途中强杀验证）。
 
 ## 设计说明：为什么"未采到"不会变成删除
 
 发布集只由**本批次成功条目**构成，且发布闸门要求整批 `completed`。
 分页失败/换版时作业进入 `failed/edition_changed`，发布被拒绝，当前生效发布保持不变，
 因此缺采只会阻断发布，绝不会把缺失数据写成"删除"。
+
+## 设计说明：页面尝试如何在强杀后仍可区分新旧
+
+每个列表页/详情页的一次处理对应一条 `PageAttempt`（`src/core/types.ts`），独立于作业快照，
+append-only 落盘（嵌入式存储为 `attempts/` 目录每尝试一个文件；Postgres 为 `page_attempts` 表，
+且只允许 `in_flight` 行更新为终态，历史行不可改写）。四种结局：
+
+| 结局 | 含义 | 是否发请求 | 是否带 snapshotId |
+| --- | --- | --- | --- |
+| `fetched` | 本次重新请求成功，快照与检查点都已落盘 | 是 | 是 |
+| `reused` | 本次直接复用已落盘快照，未发请求 | 否 | 是（指向被复用快照） |
+| `failed` | 本次请求失败，无新快照，保留错误信息 | 是（失败） | 否 |
+| `in_flight` | 已登记但结局未知——典型为请求途中进程被 SIGKILL | 进行中 | 否 |
+
+关键时序：**发请求前先写 `in_flight`，请求成功并完成快照+作业检查点落盘后才把同一尝试落定为
+`fetched`**。因此请求途中强杀时，该尝试永久停留在 `in_flight`（`finishedAt=null`）；重启后的
+新尝试使用全新 `attemptId` 另写一条，旧记录原样保留，值班员可凭 `attemptId/startedAt` 明确区分
+"结果未知的旧尝试"与"新尝试"。只有 `fetched`（检查点确实落盘）的页面才算采集成功，
+`in_flight/failed` 一律没有 `snapshotId`，页面不会被误报为成功。
+
+**单次推进的诊断写入量有常数上界**：一次页面处理至多两份物理写（`in_flight` 登记 + 终态落定），
+复用场景仅一份。诊断是按"本次触及的页面"追加，而不是读取或重写全部历史，所以无论历史上失败/
+重试了多少次，下一次推进新增的诊断量都只取决于本次实际碰到的页面数，不随历史次数线性增长。
+`tests/page-attempts.test.ts` 以物理文件数对此做了断言。
+
+## 设计说明：列表分页也能断点续跑
+
+列表发现同样检查点化：每个列表页抓到后立即持久化并记录尝试。重启后续跑先逐个**复用**已落盘的
+列表页快照（`reused`，不发请求）重建条目与续页指针，只对崩溃/失败时缺失的续页发起补抓；
+列表阶段失败时作业保持 `failed` 且 `listDiscoveryDone=false`，故障消除后可继续，不会被误判完成。
+
+## 故障注入环境变量（仅模拟站点、验证用）
+
+| 变量 | 作用 | 示例 |
+| --- | --- | --- |
+| `MOCK_FAULTS` | 逗号分隔的 `URL片段:故障类型`，类型为 `error`/`slow`/`garbled` | `G2026-021:slow,G2026-018?page=2:error` |
+| `MOCK_SLOW_DELAY_MS` | `slow` 故障的挂起时长（毫秒），默认 600000，用于在请求途中强杀 | `600000` |
+
