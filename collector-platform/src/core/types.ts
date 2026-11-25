@@ -207,6 +207,22 @@ export interface CrawlJob {
   publicationId: string | null;
 }
 
+/**
+ * 作业级轻量推进状态。详情页/条目检查点按 entryIndex 单独写入，
+ * 避免每次翻页重写包含全部已完成记录的 CrawlJob。
+ */
+export interface JobProgressCheckpoint {
+  status: JobStatus;
+  updatedAt: string;
+  finishedAt: string | null;
+  lastError: string | null;
+  publicationId?: string | null;
+  /** 供轻量作业索引更新；旧存储实现可忽略 */
+  sourceId?: string;
+  ruleId?: string;
+  ruleVersion?: string;
+}
+
 /* ----------------------------- 回归夹具与报告 ----------------------------- */
 
 export interface FixtureEntry {
@@ -343,6 +359,18 @@ export interface Store {
   saveJob(job: CrawlJob): Promise<void>;
   getJob(jobId: string): Promise<CrawlJob | null>;
   listJobs(): Promise<CrawlJob[]>;
+
+  /**
+   * 可选的细粒度作业检查点。支持时，详情翻页/条目提交只读写当前条目，
+   * 不应序列化整份 CrawlJob；getJob/listJobs 仍负责合并为整批作业视图。
+   */
+  saveJobEntryCheckpoint?(jobId: string, entryIndex: number, entry: JobEntryState): Promise<void>;
+  getJobEntryCheckpoint?(jobId: string, entryIndex: number): Promise<JobEntryState | null>;
+  listJobEntryCheckpoints?(jobId: string): Promise<JobEntryState[]>;
+  saveJobProgress?(jobId: string, progress: JobProgressCheckpoint): Promise<void>;
+  getJobProgress?(jobId: string): Promise<JobProgressCheckpoint | null>;
+  /** 轻量查找可续跑作业，避免 startOrResume 为查找而合并全部整批作业数据。 */
+  findResumableJobId?(sourceId: string, ruleId: string, ruleVersion: string): Promise<string | null>;
 
   saveRegressionReport(report: RegressionReport): Promise<void>;
   getRegressionReport(reportId: string): Promise<RegressionReport | null>;

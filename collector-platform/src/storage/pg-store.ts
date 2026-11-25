@@ -9,6 +9,8 @@ import type {
   Snapshot,
   RegressionFixture,
   CrawlJob,
+  JobEntryState,
+  JobProgressCheckpoint,
   RegressionReport,
   Publication,
   SourceConfig,
@@ -34,6 +36,14 @@ export class PostgresStore implements Store {
         fixture_id TEXT PRIMARY KEY, doc JSONB NOT NULL
       );
       CREATE TABLE IF NOT EXISTS jobs (
+        job_id TEXT PRIMARY KEY, doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE TABLE IF NOT EXISTS job_entry_checkpoints (
+        job_id TEXT NOT NULL, entry_index INTEGER NOT NULL, doc JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (job_id, entry_index)
+      );
+      CREATE TABLE IF NOT EXISTS job_progress (
         job_id TEXT PRIMARY KEY, doc JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
       CREATE TABLE IF NOT EXISTS regression_reports (
@@ -123,19 +133,124 @@ export class PostgresStore implements Store {
   }
 
   async saveJob(j: CrawlJob): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO jobs (job_id, doc, updated_at) VALUES ($1,$2,$3)
-       ON CONFLICT (job_id) DO UPDATE SET doc=EXCLUDED.doc, updated_at=EXCLUDED.updated_at`,
-      [j.jobId, JSON.stringify(j), j.updatedAt],
-    );
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO jobs (job_id, doc, updated_at) VALUES ($1,$2,$3)
+         ON CONFLICT (job_id) DO UPDATE SET doc=EXCLUDED.doc, updated_at=EXCLUDED.updated_at`,
+        [j.jobId, JSON.stringify(j), j.updatedAt],
+      );
+      // 整批 saveJob 是完整替换语义；删除细粒度附属状态，避免旧检查点覆盖新文档。
+      await client.query(`DELETE FROM job_entry_checkpoints WHERE job_id=$1`, [j.jobId]);
+      await client.query(`DELETE FROM job_progress WHERE job_id=$1`, [j.jobId]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
   }
+
   async getJob(id: string): Promise<CrawlJob | null> {
     const r = await this.pool.query<{ doc: CrawlJob }>(`SELECT doc FROM jobs WHERE job_id=$1`, [id]);
+    const job = r.rows[0]?.doc ?? null;
+    if (!job) return null;
+
+    const progress = await this.getJobProgress(id);
+    if (progress) Object.assign(job, progress);
+
+    const rows = await this.readJobEntryCheckpointRows(id);
+    if (rows.length > 0) {
+      const baseEntries = Array.isArray(job.entries) ? job.entries : [];
+      const byIndex = new Map(rows.map((r) => [r.index, r.entry]));
+      const maxIndex = rows.reduce((max, r) => Math.max(max, r.index), -1);
+      const merged: JobEntryState[] = [];
+      for (let i = 0; i < Math.max(baseEntries.length, maxIndex + 1); i += 1) {
+        const checkpoint = byIndex.get(i);
+        const base = baseEntries[i];
+        if (checkpoint) merged[i] = checkpoint;
+        else if (base) merged[i] = base;
+      }
+      job.entries = merged.filter((e): e is JobEntryState => Boolean(e));
+    }
+    return job;
+  }
+
+  async listJobs(): Promise<CrawlJob[]> {
+    const r = await this.pool.query<{ job_id: string }>(`SELECT job_id FROM jobs ORDER BY updated_at DESC`);
+    const jobs: CrawlJob[] = [];
+    for (const row of r.rows) {
+      const job = await this.getJob(row.job_id);
+      if (job) jobs.push(job);
+    }
+    return jobs;
+  }
+
+  async saveJobEntryCheckpoint(jobId: string, entryIndex: number, entry: JobEntryState): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO job_entry_checkpoints (job_id, entry_index, doc, updated_at)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (job_id, entry_index)
+       DO UPDATE SET doc=EXCLUDED.doc, updated_at=EXCLUDED.updated_at`,
+      [jobId, entryIndex, JSON.stringify(entry), entry.updatedAt],
+    );
+  }
+
+  async getJobEntryCheckpoint(jobId: string, entryIndex: number): Promise<JobEntryState | null> {
+    const r = await this.pool.query<{ doc: JobEntryState }>(
+      `SELECT doc FROM job_entry_checkpoints WHERE job_id=$1 AND entry_index=$2`,
+      [jobId, entryIndex],
+    );
     return r.rows[0]?.doc ?? null;
   }
-  async listJobs(): Promise<CrawlJob[]> {
-    const r = await this.pool.query<{ doc: CrawlJob }>(`SELECT doc FROM jobs ORDER BY updated_at DESC`);
-    return r.rows.map((x) => x.doc);
+
+  async listJobEntryCheckpoints(jobId: string): Promise<JobEntryState[]> {
+    return (await this.readJobEntryCheckpointRows(jobId)).map((r) => r.entry);
+  }
+
+  private async readJobEntryCheckpointRows(
+    jobId: string,
+  ): Promise<Array<{ index: number; entry: JobEntryState }>> {
+    const r = await this.pool.query<{ entry_index: number; doc: JobEntryState }>(
+      `SELECT entry_index, doc FROM job_entry_checkpoints WHERE job_id=$1 ORDER BY entry_index`,
+      [jobId],
+    );
+    return r.rows.map((row) => ({ index: row.entry_index, entry: row.doc }));
+  }
+
+  async saveJobProgress(jobId: string, progress: JobProgressCheckpoint): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO job_progress (job_id, doc, updated_at)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (job_id) DO UPDATE SET doc=EXCLUDED.doc, updated_at=EXCLUDED.updated_at`,
+      [jobId, JSON.stringify(progress), progress.updatedAt],
+    );
+  }
+
+  async getJobProgress(jobId: string): Promise<JobProgressCheckpoint | null> {
+    const r = await this.pool.query<{ doc: JobProgressCheckpoint }>(
+      `SELECT doc FROM job_progress WHERE job_id=$1`,
+      [jobId],
+    );
+    return r.rows[0]?.doc ?? null;
+  }
+
+  async findResumableJobId(sourceId: string, ruleId: string, ruleVersion: string): Promise<string | null> {
+    const r = await this.pool.query<{ job_id: string }>(
+      `SELECT j.job_id
+       FROM jobs j
+       LEFT JOIN job_progress p ON p.job_id = j.job_id
+       WHERE j.doc->>'sourceId' = $1
+         AND j.doc->>'ruleId' = $2
+         AND j.doc->>'ruleVersion' = $3
+         AND COALESCE(p.doc->>'status', j.doc->>'status') IN ('running', 'failed')
+       ORDER BY j.updated_at DESC
+       LIMIT 1`,
+      [sourceId, ruleId, ruleVersion],
+    );
+    return r.rows[0]?.job_id ?? null;
   }
 
   async saveRegressionReport(rep: RegressionReport): Promise<void> {

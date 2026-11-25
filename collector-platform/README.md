@@ -8,7 +8,7 @@
 ```bash
 npm install
 npm run demo     # 端到端验收演示：50 项断言，覆盖全部要求场景（约 1 秒）
-npm test         # 22 个单元/集成测试（node:test，约 1 秒）
+npm test         # 25 个单元/集成测试（node:test，约 1 秒）
 npm run verify:restart  # 真实进程强杀后重启，验证检查点续跑（约 3 秒）
 npm start        # 启动本地网页界面与 REST 接口：http://localhost:8080
 ```
@@ -32,7 +32,7 @@ npm start        # 启动本地网页界面与 REST 接口：http://localhost:80
 | 网页快照 + 回归夹具 | 每次抓取存快照；夹具带期望 canonical 结果，可完全离线重放 |
 | 重放报告 | 新增/删除/字段变化/类型不兼容/新失败，逐条带原始网页证据（URL、选择器、表格行列、分页） |
 | 来源变化 vs 规则行为变化 | 四象限归因 `attributeChanges`：旧快照×新旧规则隔离规则侧，同规则×新旧快照隔离来源侧；对照存在失败时标 `undeterminable` |
-| 中断续跑 | 列表/条目/每页均落检查点（`CrawlService`）；重启后识别同来源同规则的未完成作业，复用已抓快照 |
+| 中断续跑 | 列表页、详情原页与条目提交均有检查点；详情原页使用按作业/条目/页码/URL 生成的确定性 ID，原页落盘后即使条目检查点尚未写入，重启也能找回且不重抓。详情翻页只写当前条目检查点，不再每页重写整份作业；`getJob/listJobs` 仍合并返回完整作业（`src/service/crawl-service.ts`、`src/storage/embedded-store.ts`） |
 | 采集中换版 | 来源修订（revision）逐页校验，不一致即 `edition_changed` 并阻断发布 |
 | 分页失败 | 已采页面保留、条目标 failed、批次不完整；"未采到"永不解释为删除 |
 | 发布闸门 | 仅 完整批次 + 同一来源修订 + 同一规则版本 + 回归通过 可发布；无夹具拒绝发布 |
@@ -149,6 +149,16 @@ npm start
 - **G2026-999**：身份字段缺失的记录级失败素材；
 - `edition v1 → v2`：A 公告限重真实变化（30t→28t），用于双变归因；
 - `switchAfter` 故障注入：采集中换版；`faults` 注入：分页抓取失败后恢复。
+
+## 详情检查点：为什么翻页读写不会随历史条目膨胀
+
+旧实现每抓一页都调用一次 `saveJob(job)`，会把此前所有已完成条目的记录反复序列化和重写。现在写入路径拆成三层：
+
+1. **原页快照**：继续写入既有 `snapshots/`，详情页使用确定性 ID。即使进程在“快照 rename 成功后、条目检查点写入前”被 `SIGKILL`，新进程也能用相同 ID 读回该原页，不重新请求。
+2. **当前条目检查点**：`job-entry-checkpoints/<jobId>/<entryIndex>.json` 只保存当前 `JobEntryState`；条目完成记录通过该文件的原子 rename 提交，不存在 `status=done` 但缺少 `record` 的中间态。
+3. **作业状态/索引**：`job-progress/<jobId>.json` 与 `meta/job-index__<jobId>.json` 只保存状态、时间戳和恢复查找键。
+
+`EmbeddedStore.getJob/listJobs` 会读取并合并这些分片，因此既有作业接口、HTTP 返回结构、旧的整份 `jobs/<jobId>.json` 作业和发布逻辑保持不变；这类合并读取就是需求中允许的“返回整批作业数据的读取”。`npm test` 中的读写量用例比较 8/48 个已完成条目，并包含真实子进程 `SIGKILL` 验证。
 
 ## 设计说明：为什么"未采到"不会变成删除
 
