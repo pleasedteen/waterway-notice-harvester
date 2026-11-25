@@ -14,7 +14,9 @@ import type {
   RegressionReport,
   Publication,
   SourceConfig,
+  MergeChunkDoc,
 } from '../core/types.js';
+import { MERGE_CHUNK_CONTENT_TYPE } from '../core/merge-checkpoint.js';
 
 export class EmbeddedStore implements Store {
   constructor(private readonly root: string) {}
@@ -28,7 +30,7 @@ export class EmbeddedStore implements Store {
   }
 
   async init(): Promise<void> {
-    for (const d of ['rules', 'snapshots', 'fixtures', 'jobs', 'reports', 'publications', 'sources', 'meta']) {
+    for (const d of ['rules', 'snapshots', 'fixtures', 'jobs', 'reports', 'publications', 'sources', 'meta', 'merge-chunks']) {
       await mkdir(join(this.root, d), { recursive: true });
     }
   }
@@ -91,7 +93,19 @@ export class EmbeddedStore implements Store {
   }
   async listSnapshots(sourceId?: string): Promise<Snapshot[]> {
     const all = await this.listJson<Snapshot>('snapshots');
-    return all.filter((s) => !sourceId || s.sourceId === sourceId).sort((a, b) => a.fetchedAt.localeCompare(b.fetchedAt));
+    return all
+      // 归并分片的快照信封是内部检查点，不出现在普通快照清单/证据浏览中
+      .filter((s) => s.snapshotKind !== 'merge_chunk' && s.contentType !== MERGE_CHUNK_CONTENT_TYPE)
+      .filter((s) => !sourceId || s.sourceId === sourceId)
+      .sort((a, b) => a.fetchedAt.localeCompare(b.fetchedAt));
+  }
+
+  /** 逐页归并分片：确定性 id，原子写；每页只写自己的等长分片 */
+  async saveMergeChunk(chunk: MergeChunkDoc): Promise<void> {
+    await this.atomicWriteJson(this.path('merge-chunks', chunk.chunkId), chunk);
+  }
+  getMergeChunk(chunkId: string): Promise<MergeChunkDoc | null> {
+    return this.readJson<MergeChunkDoc>(this.path('merge-chunks', chunkId));
   }
 
   async saveFixture(f: RegressionFixture): Promise<void> {

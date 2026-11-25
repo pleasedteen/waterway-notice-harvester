@@ -8,7 +8,7 @@
 ```bash
 npm install
 npm run demo     # 端到端验收演示：50 项断言，覆盖全部要求场景（约 1 秒）
-npm test         # 22 个单元/集成测试（node:test，约 1 秒）
+npm test         # 全部单元/集成测试（node:test，含逐页归并检查点/中断恢复/线性写入验证，约 1-2 秒）
 npm run verify:restart  # 真实进程强杀后重启，验证检查点续跑（约 3 秒）
 npm start        # 启动本地网页界面与 REST 接口：http://localhost:8080
 ```
@@ -32,7 +32,9 @@ npm start        # 启动本地网页界面与 REST 接口：http://localhost:80
 | 网页快照 + 回归夹具 | 每次抓取存快照；夹具带期望 canonical 结果，可完全离线重放 |
 | 重放报告 | 新增/删除/字段变化/类型不兼容/新失败，逐条带原始网页证据（URL、选择器、表格行列、分页） |
 | 来源变化 vs 规则行为变化 | 四象限归因 `attributeChanges`：旧快照×新旧规则隔离规则侧，同规则×新旧快照隔离来源侧；对照存在失败时标 `undeterminable` |
-| 中断续跑 | 列表/条目/每页均落检查点（`CrawlService`）；重启后识别同来源同规则的未完成作业，复用已抓快照 |
+| 中断续跑 | 列表/条目/每页均落检查点（`CrawlService`）；详情抽取为**逐页提交的归并流程**：每页片段写不可变归并分片并推进 `mergedPageCount` 游标，恢复时只折叠分片、只读尚未归并的原页；重启后识别同来源同规则的未完成作业，复用已抓快照，升级前旧作业按原编号迁移续跑 |
+| 归并逻辑共用 | 在线逐页归并与离线快照回放都调用 `extractor.ts` 的同一个折叠器（`createDetailMergeState` / `mergePageIntoState` / `mergeFragmentIntoState`，`mergeDetailPages` 即其整批折叠），字段与证据语义完全一致 |
+| 线性检查点写入 | 等长且持续新增记录的续页下，每页只写本页分片与常数大小的作业游标（终态才回填完整记录/`snapshotIds`），累计检查点写入量 Θ(页数)，不产生"累计记录每页全量重写"的平方放大；`tests/zz-verify-page-checkpoint.test.ts` 用内置 `StaticFetcher` 长续页站点实测提交前/后中断恢复、原页读取边界与实际写入字节 |
 | 采集中换版 | 来源修订（revision）逐页校验，不一致即 `edition_changed` 并阻断发布 |
 | 分页失败 | 已采页面保留、条目标 failed、批次不完整；"未采到"永不解释为删除 |
 | 发布闸门 | 仅 完整批次 + 同一来源修订 + 同一规则版本 + 回归通过 可发布；无夹具拒绝发布 |

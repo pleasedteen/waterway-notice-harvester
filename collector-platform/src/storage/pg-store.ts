@@ -13,6 +13,7 @@ import type {
   Publication,
   SourceConfig,
   BusinessRecord,
+  MergeChunkDoc,
 } from '../core/types.js';
 
 export class PostgresStore implements Store {
@@ -49,6 +50,9 @@ export class PostgresStore implements Store {
       );
       CREATE TABLE IF NOT EXISTS sources (
         source_id TEXT PRIMARY KEY, doc JSONB NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS merge_chunks (
+        chunk_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, page INT NOT NULL, doc JSONB NOT NULL
       );
     `);
   }
@@ -210,6 +214,21 @@ export class PostgresStore implements Store {
   async listSources(): Promise<SourceConfig[]> {
     const r = await this.pool.query<{ doc: SourceConfig }>(`SELECT doc FROM sources`);
     return r.rows.map((x) => x.doc);
+  }
+
+  async saveMergeChunk(chunk: MergeChunkDoc): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO merge_chunks (chunk_id, job_id, page, doc) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (chunk_id) DO UPDATE SET doc=EXCLUDED.doc`,
+      [chunk.chunkId, chunk.jobId, chunk.page, JSON.stringify(chunk)],
+    );
+  }
+  async getMergeChunk(chunkId: string): Promise<MergeChunkDoc | null> {
+    const r = await this.pool.query<{ doc: MergeChunkDoc }>(
+      `SELECT doc FROM merge_chunks WHERE chunk_id=$1`,
+      [chunkId],
+    );
+    return r.rows[0]?.doc ?? null;
   }
 }
 

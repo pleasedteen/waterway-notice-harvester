@@ -1,6 +1,9 @@
 /**
  * 采集编排：
- * - 每个条目/分页完成即落检查点，进程重启后从断点继续；
+ * - 详情抽取是"逐页提交 + 可恢复"的归并流程：每页片段写归并分片并推进游标；
+ *   恢复时只折叠分片、只读尚未归并的原页，累计检查点写入量随页数线性；
+ * - 在线逐页归并与离线回放共用 core/extractor 的同一折叠器；
+ * - 每个条目/分页完成即落检查点，进程重启后从断点继续，旧检查点按原作业编号迁移；
  * - 全程校验来源 revision，发现换版 => 作业置 edition_changed 并阻断发布；
  * - 分页失败不丢弃已采页，条目标 failed 且整批不完整；
  * - "未采到"绝不解释为删除：只有整批成功完成才可发布，发布集仅来自本批记录。
@@ -9,14 +12,23 @@ import { contentHash, type Fetcher } from '../fetch/fetcher.js';
 import {
   extractListEntries,
   extractNextPage,
-  mergeDetailPages,
+  extractDetailPage,
+  createDetailMergeState,
+  mergeFragmentIntoState,
   type PageDocument,
 } from '../core/extractor.js';
+import {
+  ChunkBackend,
+  chunkIdOf,
+  entryKeyOf,
+  rawSnapshotIdOf,
+} from '../core/merge-checkpoint.js';
 import { newId, nowIso } from '../core/ids.js';
 import type {
   BusinessRecord,
   CrawlJob,
   JobEntryState,
+  MergeChunkDoc,
   RuleDocument,
   Snapshot,
   Store,
@@ -59,6 +71,10 @@ export class CrawlService {
       publicationId: null,
     };
     await this.store.saveJob(job);
+    // 无 list 时 seedUrl 即第一条详情的第 1 页：把启动探测抓取复用为 p1 原快照，避免重复抓取。
+    if (!input.rule.list) {
+      await this.persistSnapshot(job, first, input.seedUrl, rawSnapshotIdOf(job.jobId, entryKeyOf(0), 1));
+    }
     return job;
   }
 
@@ -125,6 +141,22 @@ export class CrawlService {
   }
 
   private async discoverEntries(job: CrawlJob, rule: RuleDocument): Promise<void> {
+    // 无 list 配置：按 RuleDocument 契约，seedUrl 本身就是单条详情页。
+    if (!rule.list) {
+      job.entries.push({
+        entryUrl: job.seedUrl,
+        prefetch: {},
+        status: 'pending',
+        snapshotIds: [],
+        pagesMerged: [],
+        record: null,
+        attempts: 0,
+        lastError: null,
+        updatedAt: nowIso(),
+      });
+      await this.store.saveJob(job);
+      return;
+    }
     const seen = new Set<string>();
     let listUrl: string | null = job.seedUrl;
     let listPageNo = 0;
@@ -157,45 +189,180 @@ export class CrawlService {
     }
   }
 
+  /**
+   * 采集并归并一个条目（逐页提交、可恢复）。
+   *
+   * 检查点协议：
+   *  1. （恢复时）按 entry.mergedPageCount 从归并分片折叠出累计状态，不读已归并原页；
+   *  2. 每页：取未归并原页（优先复用同 id 快照，否则联网抓取）-> 抽取单页片段
+   *     -> 写该页归并分片 -> 推进 mergedPageCount/nextPageUrl 并 saveJob 提交；
+   *  3. 全部页完成后用同一归并器产出 entry.record，补齐 snapshotIds 并置 done。
+   *
+   * 提交前后中断都安全：
+   *  - 提交前中断：游标未前进，恢复时重做该页（确定性分片/快照 id 覆盖写，归并不重复计数）；
+   *  - 提交后中断：游标已前进，恢复时只读其后尚未归并的原页/分片。
+   */
   private async crawlEntry(job: CrawlJob, rule: RuleDocument, entry: JobEntryState): Promise<void> {
     entry.attempts += 1;
-    const pages: PageDocument[] = [];
-    // 续跑：已成功的分页快照直接复用，不重复抓取
-    const existingSnaps: Snapshot[] = [];
-    for (const sid of entry.snapshotIds) {
-      const s = await this.store.getSnapshot(sid);
-      if (s) existingSnaps.push(s);
-    }
-    for (const s of existingSnaps) {
-      pages.push({ url: s.url, html: s.html, page: pages.length + 1 });
-    }
+    const entryIndex = job.entries.indexOf(entry);
+    // 正常路径条目就在 job.entries 中，使用稳定下标；极端情况下用 URL 哈希避免多条目分片键碰撞。
+    const entryKey = entryIndex >= 0 ? entryKeyOf(entryIndex) : `u${stableHash(entry.entryUrl)}`;
+    const chunks = new ChunkBackend(this.store, job.sourceId);
+    const mergeState = createDetailMergeState();
+    /** 已归并页对应的原快照 id（按页序），终态写回 entry.snapshotIds */
+    const rawSnapshotIds: string[] = [];
 
-    let nextUrl: string | null = pages.length === 0 ? entry.entryUrl : this.nextUrlOf(rule, pages[pages.length - 1]!);
-    let guard = 0;
+    let mergedCount = 0;
+    let nextUrl: string | null = null;
+
     try {
-      while (nextUrl && guard < (rule.pagination?.maxPages ?? 1)) {
-        guard += 1;
-        const fetched = await this.fetcher.fetch(nextUrl);
-        this.checkRevision(job, fetched.revision, nextUrl);
-        if (job.status === 'edition_changed') return;
-        const snap = await this.persistSnapshot(job, fetched, nextUrl);
-        if (!entry.snapshotIds.includes(snap.snapshotId)) entry.snapshotIds.push(snap.snapshotId);
-        pages.push({ url: nextUrl, html: snap.html, page: pages.length + 1 });
-        await this.store.saveJob(job); // 每页落检查点
-        nextUrl = rule.pagination ? extractNextPage(snap.html, rule.pagination, nextUrl) : null;
+      if (typeof entry.mergedPageCount === 'number') {
+        // 新检查点：只从逐页分片恢复归并状态；绝不 getSnapshot 已归并的原页。
+        mergedCount = entry.mergedPageCount;
+        for (let p = 1; p <= mergedCount; p += 1) {
+          const chunk = await chunks.getChunk(chunkIdOf(job.jobId, entryKey, p));
+          if (!chunk) {
+            // 分片缺失属于存储不一致；回退到该页原快照重建，仍保证结果正确。
+            const rebuilt = await this.rebuildChunkFromRawSnapshot(job, chunks, entry, entryKey, p, rule);
+            mergeFragmentIntoState(mergeState, rebuilt.fragment);
+            rawSnapshotIds.push(rebuilt.snapshotId);
+            continue;
+          }
+          mergeFragmentIntoState(mergeState, chunk.fragment);
+          rawSnapshotIds.push(chunk.snapshotId);
+        }
+        nextUrl =
+          entry.nextPageUrl !== undefined
+            ? entry.nextPageUrl
+            : mergedCount === 0
+              ? entry.entryUrl
+              : (await chunks.getChunk(chunkIdOf(job.jobId, entryKey, mergedCount)))?.nextPageUrl ?? null;
+      } else {
+        // 升级前旧检查点：snapshotIds 中所有原页都尚未经新归并器提交，
+        // 读取它们并一次性重建分片/游标（仅升级恢复时发生，按原作业编号续跑）。
+        const existingSnaps: Snapshot[] = [];
+        for (const sid of entry.snapshotIds) {
+          const s = await this.store.getSnapshot(sid);
+          if (s) existingSnaps.push(s);
+        }
+        const pages: PageDocument[] = existingSnaps.map((s, i) => ({
+          url: s.url,
+          html: s.html,
+          page: i + 1,
+        }));
+        for (const page of pages) {
+          const fragment = extractDetailPage(page, rule);
+          const following = rule.pagination
+            ? extractNextPage(page.html, rule.pagination, page.url)
+            : null;
+          const chunk: MergeChunkDoc = {
+            kind: 'detail-merge-chunk',
+            version: 1,
+            chunkId: chunkIdOf(job.jobId, entryKey, page.page),
+            jobId: job.jobId,
+            entryKey,
+            page: page.page,
+            snapshotId: existingSnaps[page.page - 1]!.snapshotId,
+            nextPageUrl: following,
+            fragment,
+          };
+          await chunks.saveChunk(chunk);
+          mergeFragmentIntoState(mergeState, fragment);
+          rawSnapshotIds.push(chunk.snapshotId);
+        }
+        mergedCount = pages.length;
+        nextUrl =
+          pages.length === 0
+            ? entry.entryUrl
+            : rule.pagination
+              ? extractNextPage(pages[pages.length - 1]!.html, rule.pagination, pages[pages.length - 1]!.url)
+              : null;
+        entry.mergedPageCount = mergedCount;
+        entry.nextPageUrl = nextUrl;
       }
 
-      // 合并预取字段（缺失不覆盖详情页结果）
-      const record: BusinessRecord = mergeDetailPages(pages, rule);
+      // 逐页抓取/复用未归并原页 -> 抽取 -> 写分片 -> saveJob 提交游标。
+      const maxPages = rule.pagination?.maxPages ?? 1;
+      let processed = mergedCount;
+      while (nextUrl && processed < maxPages) {
+        const pageNo = processed + 1;
+        processed = pageNo;
+
+        // 优先复用"已抓未归并"的确定性原快照（提交前中断窗口），否则联网抓取。
+        const rawId = rawSnapshotIdOf(job.jobId, entryKey, pageNo);
+        const existing = await this.store.getSnapshot(rawId);
+        let html: string;
+        let url: string;
+        let snapshotId: string;
+        let revision: string;
+        if (existing && existing.html) {
+          html = existing.html;
+          url = existing.url || nextUrl;
+          snapshotId = existing.snapshotId;
+          revision = existing.revision;
+        } else {
+          const fetched = await this.fetcher.fetch(nextUrl);
+          // 与历史行为一致：先校验 revision，换版直接阻断，不落该页快照/分片。
+          this.checkRevision(job, fetched.revision, nextUrl);
+          if (job.status === 'edition_changed') return;
+          const snap = await this.persistSnapshot(job, fetched, nextUrl, rawId);
+          html = snap.html;
+          url = nextUrl;
+          snapshotId = snap.snapshotId;
+          revision = snap.revision;
+        }
+        this.checkRevision(job, revision, url);
+        if (job.status === 'edition_changed') return;
+
+        const page: PageDocument = { url, html, page: pageNo };
+        const fragment = extractDetailPage(page, rule);
+        const following = rule.pagination ? extractNextPage(html, rule.pagination, url) : null;
+
+        const chunk: MergeChunkDoc = {
+          kind: 'detail-merge-chunk',
+          version: 1,
+          chunkId: chunkIdOf(job.jobId, entryKey, pageNo),
+          jobId: job.jobId,
+          entryKey,
+          page: pageNo,
+          snapshotId,
+          nextPageUrl: following,
+          fragment,
+        };
+        // 先写本分页分片（每页 O(本页大小)），再以 saveJob 游标推进作为提交点。
+        await chunks.saveChunk(chunk);
+        mergeFragmentIntoState(mergeState, fragment);
+        if (rawSnapshotIds.length < pageNo) rawSnapshotIds.push(snapshotId);
+        else rawSnapshotIds[pageNo - 1] = snapshotId;
+
+        mergedCount = pageNo;
+        entry.mergedPageCount = mergedCount;
+        entry.nextPageUrl = following;
+        // 既有字段的轻量可见性：提交后即可见已归并页码（仅标量序号，不承载累计记录）。
+        entry.pagesMerged = Array.from({ length: mergedCount }, (_, i) => i + 1);
+        await this.store.saveJob(job); // 逐页检查点提交点（作业文档不随页数累积膨胀）
+
+        nextUrl = following;
+      }
+
+      // 归并完成：折叠状态即最终记录，再合并预取字段（缺失不覆盖详情页结果）。
+      const record: BusinessRecord = mergeState.record ?? (() => {
+        throw new Error('归并失败：无可用分页');
+      })();
+      record.pagesMerged = [...mergeState.pageNumbers];
       for (const [k, v] of Object.entries(entry.prefetch)) {
         if (!record.fields[k] && v.value.status !== 'missing') record.fields[k] = v;
       }
       entry.record = record;
-      entry.pagesMerged = record.pagesMerged;
+      entry.pagesMerged = [...record.pagesMerged];
+      entry.snapshotIds = rawSnapshotIds.slice();
       entry.status = 'done';
       entry.lastError = null;
+      entry.nextPageUrl = null;
     } catch (e) {
-      // 分页失败：保留已采页面与检查点，条目标 failed，整批不完整
+      // 分页/提交失败：保留已采页面与检查点，条目标 failed，整批不完整。
+      // 已得到的原快照 id 尽量写回（旧字段语义：失败时 snapshotIds.length >= 1）。
+      if (rawSnapshotIds.length > 0) entry.snapshotIds = rawSnapshotIds.slice();
       entry.status = 'failed';
       entry.lastError = (e as Error).message;
       job.lastError = `条目 ${entry.entryUrl} 采集失败: ${entry.lastError}`;
@@ -205,9 +372,34 @@ export class CrawlService {
     await this.store.saveJob(job);
   }
 
-  private nextUrlOf(rule: RuleDocument, lastPage: PageDocument): string | null {
-    if (!rule.pagination) return null;
-    return extractNextPage(lastPage.html, rule.pagination, lastPage.url);
+  /** 分片缺失的防御性重建：按条目 snapshotIds 中的对应原快照重新抽取该页 */
+  private async rebuildChunkFromRawSnapshot(
+    job: CrawlJob,
+    chunks: ChunkBackend,
+    entry: JobEntryState,
+    entryKey: string,
+    page: number,
+    rule: RuleDocument,
+  ): Promise<MergeChunkDoc> {
+    const sid = entry.snapshotIds[page - 1];
+    if (!sid) throw new Error(`归并检查点分片缺失且无原快照索引: page ${page}`);
+    const snap = await this.store.getSnapshot(sid);
+    if (!snap) throw new Error(`归并检查点分片与原快照均缺失: page ${page} (${sid})`);
+    const pageDoc: PageDocument = { url: snap.url, html: snap.html, page };
+    const fragment = extractDetailPage(pageDoc, rule);
+    const chunk: MergeChunkDoc = {
+      kind: 'detail-merge-chunk',
+      version: 1,
+      chunkId: chunkIdOf(job.jobId, entryKey, page),
+      jobId: job.jobId,
+      entryKey,
+      page,
+      snapshotId: sid,
+      nextPageUrl: rule.pagination ? extractNextPage(snap.html, rule.pagination, snap.url) : null,
+      fragment,
+    };
+    await chunks.saveChunk(chunk);
+    return chunk;
   }
 
   private checkRevision(job: CrawlJob, revision: string, url: string): void {
@@ -218,9 +410,14 @@ export class CrawlService {
     }
   }
 
-  private async persistSnapshot(job: CrawlJob, fetched: Awaited<ReturnType<Fetcher['fetch']>>, url: string): Promise<Snapshot> {
+  private async persistSnapshot(
+    job: CrawlJob,
+    fetched: Awaited<ReturnType<Fetcher['fetch']>>,
+    url: string,
+    explicitId?: string,
+  ): Promise<Snapshot> {
     const snapshot: Snapshot = {
-      snapshotId: newId('snap'),
+      snapshotId: explicitId ?? newId('snap'),
       sourceId: job.sourceId,
       revision: fetched.revision || contentHash(fetched.html),
       url,
@@ -239,4 +436,13 @@ export class CrawlService {
     if (!job) throw new Error(`作业不存在: ${jobId}`);
     return job.entries.filter((e) => e.record).map((e) => e.record!) as BusinessRecord[];
   }
+}
+
+/** 非下标的稳定短哈希（仅用于异常引用场景的分片键，不含安全语义） */
+function stableHash(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i += 1) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(36);
 }

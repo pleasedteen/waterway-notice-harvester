@@ -208,8 +208,8 @@ export function extractNextPage(html: string, pagination: NonNullable<RuleDocume
   return resolveUrl(currentUrl, href);
 }
 
-/** 从单个详情分页抽取一条未合并记录 */
-function extractDetailPage(page: PageDocument, rule: RuleDocument): BusinessRecord {
+/** 从单个详情分页抽取一条未合并记录（归并流程的单页步骤，在线/离线共用） */
+export function extractDetailPage(page: PageDocument, rule: RuleDocument): BusinessRecord {
   const doc = parseHtml(page.html);
   const fields: Record<string, ExtractedField> = {};
   for (const fr of rule.fields) {
@@ -264,26 +264,104 @@ function composeIdentity(
 }
 
 /**
+ * 逐页归并状态（monoid 折叠器）。
+ * 在线采集：每抓到一页 -> extractDetailPage -> mergeFragmentIntoState -> 提交分片/游标；
+ * 离线回放：extractFromSnapshots -> mergeDetailPages 反复调用同一个 mergePageIntoState。
+ * 因此两条链路的归并与证据语义完全一致。
+ */
+export interface DetailMergeState {
+  /** 已归并的累计记录；尚无页时为 null */
+  record: BusinessRecord | null;
+  /** 已归并分页序号（升序、去重） */
+  pageNumbers: number[];
+  /** 已归并页数 */
+  pageCount: number;
+}
+
+export function createDetailMergeState(): DetailMergeState {
+  return { record: null, pageNumbers: [], pageCount: 0 };
+}
+
+/** 将一个已抽取的单页片段折叠进归并状态（幂等性由调用方保证不重复折叠同一页） */
+export function mergeFragmentIntoState(state: DetailMergeState, fragment: BusinessRecord): BusinessRecord {
+  if (!state.record) {
+    state.record = fragment;
+  } else {
+    mergeInto(state.record, fragment);
+  }
+  for (const p of fragment.pagesMerged) {
+    if (!state.pageNumbers.includes(p)) state.pageNumbers.push(p);
+  }
+  state.pageNumbers.sort((a, b) => a - b);
+  state.pageCount += 1;
+  state.record.pagesMerged = [...state.pageNumbers];
+  return state.record;
+}
+
+/** 抽取单页并折叠进归并状态（在线逐页归并与离线整批归并共用这一步） */
+export function mergePageIntoState(
+  state: DetailMergeState,
+  page: PageDocument,
+  rule: RuleDocument,
+): BusinessRecord {
+  return mergeFragmentIntoState(state, extractDetailPage(page, rule));
+}
+
+/**
+ * 有状态的逐页归并器（便于调用方以类形式持有检查点折叠状态）。
+ * 与函数式 DetailMergeState 完全等价。
+ */
+export class DetailPageMerger {
+  readonly state = createDetailMergeState();
+
+  /** 抽取并归并一页原页面 */
+  addPage(page: PageDocument, rule: RuleDocument): BusinessRecord {
+    return mergePageIntoState(this.state, page, rule);
+  }
+
+  /** 归并一个从检查点分片读回的单页片段 */
+  addFragment(fragment: BusinessRecord): BusinessRecord {
+    return mergeFragmentIntoState(this.state, fragment);
+  }
+
+  get record(): BusinessRecord | null {
+    return this.state.record;
+  }
+
+  get pageNumbers(): number[] {
+    return this.state.pageNumbers;
+  }
+}
+
+/**
  * 合并同一航段的续页：
  * - 顶层字段：第一页的 ok 值优先，missing 用后续页补齐；
  * - 嵌套列表/表格：按 itemIdentity 合并，无身份项按内容指纹去重，保持页码与行序；
  * - 重复表头在 buildGrid 阶段已剔除；页面排序由 pages 数组顺序决定。
+ *
+ * 实现就是对共享逐页归并器的一次折叠，保证离线整批回放与在线逐页提交结果一致。
  */
 export function mergeDetailPages(pages: PageDocument[], rule: RuleDocument): BusinessRecord {
-  const pageRecs = pages
-    .slice()
-    .sort((a, b) => a.page - b.page)
-    .map((p) => extractDetailPage(p, rule));
-  if (pageRecs.length === 0) {
+  const ordered = pages.slice().sort((a, b) => a.page - b.page);
+  if (ordered.length === 0) {
     throw new Error('mergeDetailPages: 无可用分页');
   }
-  const base = pageRecs[0]!;
-  for (const next of pageRecs.slice(1)) {
-    mergeInto(base, next);
-  }
-  base.pagesMerged = [...new Set(pageRecs.flatMap((r) => r.pagesMerged))].sort((a, b) => a - b);
-  return base;
+  const state = createDetailMergeState();
+  for (const p of ordered) mergePageIntoState(state, p, rule);
+  // 与历史行为严格一致：pagesMerged 取入参分页序号（升序去重）
+  state.record!.pagesMerged = [...new Set(ordered.map((p) => p.page))].sort((a, b) => a - b);
+  return state.record!;
 }
+
+/** 单数命名别名：逐页归并一步（部分调用方按 mergeDetailPage 命名使用） */
+export const mergeDetailPage = mergePageIntoState;
+
+/** 归并检查点状态别名（逐页提交/恢复语义） */
+export type DetailMergeCheckpoint = DetailMergeState;
+export const createMergeCheckpoint = createDetailMergeState;
+
+/** reduce 命名别名：把有序分页一次性归并为记录 */
+export const reduceDetailPages = mergeDetailPages;
 
 function mergeInto(target: BusinessRecord, other: BusinessRecord): void {
   // 顶层字段

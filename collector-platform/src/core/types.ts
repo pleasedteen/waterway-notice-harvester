@@ -167,6 +167,8 @@ export interface Snapshot {
   statusCode: number;
   contentType: string;
   html: string;
+  /** 存储层内部标记：通过快照通道承载归并分片信封时为 merge_chunk；普通原页缺省/raw */
+  snapshotKind?: 'raw' | 'merge_chunk';
 }
 
 /* ----------------------------- 采集作业（检查点） ----------------------------- */
@@ -185,6 +187,46 @@ export interface JobEntryState {
   attempts: number;
   lastError: string | null;
   updatedAt: string;
+  /**
+   * 逐页归并检查点游标（新检查点）：已完成"抽取片段 -> 归并 -> 提交"的详情页数。
+   * 缺省表示升级前的旧检查点：恢复时回退为读取 snapshotIds 全部原页并一次性重建归并分片。
+   */
+  mergedPageCount?: number;
+  /** 下一页待抓取 URL，随归并游标一起提交；恢复时无需重读已归并原页即可继续翻页 */
+  nextPageUrl?: string | null;
+}
+
+/**
+ * 单页归并分片：某一详情分页抽取后的未合并片段（含证据与对应原快照 id）。
+ * 逐页不可变提交，每页写入量只与该等长页大小相关，因此累计检查点写入量随页数线性增长；
+ * 恢复时按页序读回分片并通过同一个归并函数折叠，不需要重读已归并的原始页面。
+ */
+export interface MergeChunkDoc {
+  kind: 'detail-merge-chunk';
+  version: 1;
+  /** 确定性分片 id：mc_<jobId>_<entryKey>_p<page>，崩溃重试覆盖同一分片 */
+  chunkId: string;
+  jobId: string;
+  /** 作业内条目稳定键（如 e0） */
+  entryKey: string;
+  /** 分页序号（1 基，与 Evidence.page / PageDocument.page 一致） */
+  page: number;
+  /** 该页对应的原始快照 id */
+  snapshotId: string;
+  /** 从该页分页控件解析出的下一页 URL；末页为 null */
+  nextPageUrl: string | null;
+  /** 该页抽取片段（mergeDetailPages 中单个 pageRec 的等价物） */
+  fragment: BusinessRecord;
+}
+
+/**
+ * 归并分片存储的可选能力。Store 实现了这两个方法时使用独立分片文档；
+ * 否则 CrawlService 回退到以现有 saveSnapshot/getSnapshot 存取分片信封，
+ * 从而兼容只实现旧 Store 接口的包装器/测试替身。
+ */
+export interface MergeChunkStore {
+  saveMergeChunk(chunk: MergeChunkDoc): Promise<void>;
+  getMergeChunk(chunkId: string): Promise<MergeChunkDoc | null>;
 }
 
 export interface CrawlJob {
